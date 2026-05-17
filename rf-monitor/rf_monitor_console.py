@@ -143,10 +143,71 @@ def capture_record(meta_path: Path) -> dict[str, Any]:
     data["meta_url"] = f"/api/captures/{capture_id}/meta"
     data["iq_url"] = f"/api/captures/{capture_id}/iq"
     data["spectrogram_url"] = f"/api/captures/{capture_id}/spectrogram"
+    data["animation_url"] = f"/api/captures/{capture_id}/animation"
     return data
 
 
-def summarize_iq(iq_path: Path, sample_rate_hz: int, center_frequency_hz: int, png_path: Path) -> dict[str, Any]:
+def draw_spectrum_frame(
+    Image: Any,
+    ImageDraw: Any,
+    freqs: Any,
+    spectrum_db: Any,
+    center_frequency_hz: int,
+    sample_rate_hz: int,
+    second: int,
+    total_seconds: int,
+    low_db: float,
+    high_db: float,
+) -> Any:
+    import numpy as np
+
+    width, height = 900, 520
+    left, top, right, bottom = 86, 42, 24, 66
+    plot_w = width - left - right
+    plot_h = height - top - bottom
+    img = Image.new("RGB", (width, height), (16, 20, 24))
+    draw = ImageDraw.Draw(img)
+    draw.text((22, 16), f"{center_frequency_hz / 1_000_000:.3f} MHz spectrum animation", fill=(231, 237, 242))
+    draw.text((width - 170, 16), f"{second + 1}/{total_seconds} sec", fill=(99, 210, 255))
+    draw.rectangle((left, top, left + plot_w, top + plot_h), outline=(43, 53, 61))
+
+    min_mhz = (center_frequency_hz - sample_rate_hz / 2) / 1_000_000
+    max_mhz = (center_frequency_hz + sample_rate_hz / 2) / 1_000_000
+    for i in range(5):
+        x = left + round(i * plot_w / 4)
+        y = top + round(i * plot_h / 4)
+        draw.line((x, top, x, top + plot_h), fill=(30, 38, 44))
+        draw.line((left, y, left + plot_w, y), fill=(30, 38, 44))
+        mhz = min_mhz + i * (max_mhz - min_mhz) / 4
+        db = high_db - i * (high_db - low_db) / 4
+        draw.text((x - 28, top + plot_h + 12), f"{mhz:.3f}", fill=(156, 170, 181))
+        draw.text((18, y - 7), f"{db:.0f}", fill=(156, 170, 181))
+    draw.text((left + plot_w // 2 - 54, height - 28), "Frequency (MHz)", fill=(156, 170, 181))
+    draw.text((16, top + plot_h // 2 + 22), "dB", fill=(156, 170, 181))
+
+    bins = min(700, spectrum_db.size)
+    sample_idx = np.linspace(0, spectrum_db.size - 1, bins).astype(np.int64)
+    values = spectrum_db[sample_idx]
+    x_vals = left + np.linspace(0, plot_w, bins)
+    y_vals = top + (1 - np.clip((values - low_db) / max(1e-6, high_db - low_db), 0, 1)) * plot_h
+    points = [(float(x), float(y)) for x, y in zip(x_vals, y_vals)]
+    if len(points) > 1:
+        draw.line(points, fill=(255, 202, 98), width=2)
+    peak_idx = int(sample_idx[int(np.argmax(values))])
+    peak_freq_mhz = (center_frequency_hz + freqs[peak_idx]) / 1_000_000
+    peak_x = left + (peak_idx / max(1, spectrum_db.size - 1)) * plot_w
+    draw.line((peak_x, top, peak_x, top + plot_h), fill=(255, 111, 145), width=1)
+    draw.text((left, height - 50), f"Peak {peak_freq_mhz:.6f} MHz   Range {low_db:.0f} to {high_db:.0f} dB", fill=(156, 170, 181))
+    return img
+
+
+def summarize_iq(
+    iq_path: Path,
+    sample_rate_hz: int,
+    center_frequency_hz: int,
+    png_path: Path,
+    gif_path: Path,
+) -> dict[str, Any]:
     import numpy as np
     from PIL import Image, ImageDraw
 
@@ -196,6 +257,35 @@ def summarize_iq(iq_path: Path, sample_rate_hz: int, center_frequency_hz: int, p
     png_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(png_path)
 
+    duration = usable.size / sample_rate_hz
+    total_seconds = max(1, int(np.ceil(duration)))
+    frame_low = float(np.percentile(power_db, 10))
+    frame_high = float(np.percentile(power_db, 99.7))
+    frame_times = starts / sample_rate_hz
+    frames = []
+    for second in range(total_seconds):
+        cols = np.where((frame_times >= second) & (frame_times < second + 1))[0]
+        if cols.size == 0:
+            nearest = int(np.argmin(np.abs(frame_times - min(second, duration))))
+            cols = np.array([nearest])
+        spectrum = np.max(power_db[:, cols], axis=1)
+        frames.append(
+            draw_spectrum_frame(
+                Image,
+                ImageDraw,
+                freqs,
+                spectrum,
+                center_frequency_hz,
+                sample_rate_hz,
+                second,
+                total_seconds,
+                frame_low,
+                frame_high,
+            )
+        )
+    gif_path.parent.mkdir(parents=True, exist_ok=True)
+    frames[0].save(gif_path, save_all=True, append_images=frames[1:], duration=850, loop=0)
+
     mean_power = float(20 * np.log10(np.sqrt(np.mean(np.abs(usable) ** 2)) + 1e-12))
     return {
         "samples": int(iq.size),
@@ -203,6 +293,8 @@ def summarize_iq(iq_path: Path, sample_rate_hz: int, center_frequency_hz: int, p
         "mean_power_dbfs": round(mean_power, 2),
         "peak_frequency_hz": int(center_frequency_hz + freqs[peak_index[0]]),
         "peak_frequency_mhz": round((center_frequency_hz + freqs[peak_index[0]]) / 1_000_000, 6),
+        "animation_frame_seconds": 1,
+        "animation_frames": len(frames),
     }
 
 
@@ -220,6 +312,7 @@ def capture_signal(
     capture_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"-{frequency_hz}"
     iq_path = capture_path(capture_id, ".iq")
     png_path = capture_path(capture_id, ".png")
+    gif_path = capture_path(capture_id, ".gif")
     meta_path = capture_path(capture_id, ".json")
     sample_count = int(duration_seconds * sample_rate_hz)
     command = [
@@ -269,7 +362,7 @@ def capture_signal(
         if not iq_path.exists() or iq_path.stat().st_size == 0:
             raise RuntimeError("hackrf_transfer did not create a capture file")
         meta["iq_bytes"] = iq_path.stat().st_size
-        meta["analysis"] = summarize_iq(iq_path, sample_rate_hz, frequency_hz, png_path)
+        meta["analysis"] = summarize_iq(iq_path, sample_rate_hz, frequency_hz, png_path, gif_path)
         meta["status"] = "complete"
         meta["completed_at"] = datetime.now(timezone.utc).isoformat()
         meta_path.write_text(json.dumps(meta, indent=2))
@@ -480,6 +573,27 @@ def capture_spectrogram(capture_id: str) -> FileResponse:
     return FileResponse(path, media_type="image/png")
 
 
+@app.get("/api/captures/{capture_id}/animation")
+def capture_animation(capture_id: str) -> FileResponse:
+    path = capture_path(capture_id, ".gif")
+    if not path.exists():
+        meta_path = capture_path(capture_id, ".json")
+        iq_path = capture_path(capture_id, ".iq")
+        png_path = capture_path(capture_id, ".png")
+        if not meta_path.exists() or not iq_path.exists():
+            raise HTTPException(404, "Animation not found")
+        meta = json.loads(meta_path.read_text())
+        meta["analysis"] = summarize_iq(
+            iq_path,
+            int(meta["sample_rate_hz"]),
+            int(meta["frequency_hz"]),
+            png_path,
+            path,
+        )
+        meta_path.write_text(json.dumps(meta, indent=2))
+    return FileResponse(path, media_type="image/gif")
+
+
 @app.get("/api/captures/{capture_id}/iq")
 def capture_iq(capture_id: str) -> FileResponse:
     path = capture_path(capture_id, ".iq")
@@ -531,6 +645,7 @@ HTML = r"""<!doctype html>
     .captureActions { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:10px; }
     .captureImg { width:100%; border:1px solid var(--line); border-radius:8px; margin-top:8px; background:#0c1013; cursor:zoom-in; }
     .captureCaption { color:var(--muted); font-size:12px; line-height:1.35; margin-top:6px; }
+    .captureToggle { display:flex; gap:6px; margin-top:8px; }
     #zoomState { color: var(--hot); }
     #detailCanvas { height:220px; margin-top:10px; }
     @media (max-width: 1000px) { main { grid-template-columns: 1fr; } aside { border-left:0; border-top:1px solid var(--line); } #heatmapWrap { height: 60vh; } }
@@ -849,8 +964,12 @@ function captureItemHtml(capture) {
   const analysis = capture.analysis || {};
   const status = capture.status === 'complete' ? 'Complete' : capture.status;
   const img = capture.status === 'complete' ? `
-    <img class="captureImg" onclick="window.open('${capture.spectrogram_url}', '_blank')" src="${capture.spectrogram_url}?t=${encodeURIComponent(capture.completed_at || capture.started_at)}" alt="Spectrogram for ${capture.frequency_mhz.toFixed(3)} MHz capture">
-    <div class="captureCaption">Quick-look spectrogram. Click the image or View Spectrogram for the full-size PNG. Download IQ is the raw radio sample file for later demodulation/classification.</div>` : '';
+    <div class="captureToggle">
+      <button class="smallBtn" onclick="showCaptureArtifact('${capture.id}', '${capture.animation_url}', 'animation')">Animation</button>
+      <button class="smallBtn" onclick="showCaptureArtifact('${capture.id}', '${capture.spectrogram_url}', 'spectrogram')">Spectrogram</button>
+    </div>
+    <img id="capture-img-${capture.id}" class="captureImg" onclick="openCaptureArtifact('${capture.id}')" data-current-url="${capture.animation_url}" src="${capture.animation_url}?t=${encodeURIComponent(capture.completed_at || capture.started_at)}" alt="Animated spectrum for ${capture.frequency_mhz.toFixed(3)} MHz capture">
+    <div id="capture-caption-${capture.id}" class="captureCaption">Animated spectrum: each frame is about 1 second. X axis is frequency, Y axis is relative strength. Download IQ is the raw radio sample file for later demodulation/classification.</div>` : '';
   const peak = analysis.peak_frequency_mhz ? `<br>Peak ${analysis.peak_frequency_mhz.toFixed(6)} MHz` : '';
   return `<div class="item">
     <b>${capture.frequency_mhz.toFixed(3)} MHz</b><br>
@@ -858,12 +977,33 @@ function captureItemHtml(capture) {
     <span class="muted">${capture.started_at}</span>
     <div class="captureActions">
       <button class="smallBtn" onclick="selectFrequency(${capture.frequency_hz})">Select</button>
+      <button class="smallBtn" onclick="window.open('${capture.animation_url}', '_blank')">View Animation</button>
       <button class="smallBtn" onclick="window.open('${capture.spectrogram_url}', '_blank')">View Spectrogram</button>
       <button class="smallBtn" onclick="window.open('${capture.meta_url}', '_blank')">Details</button>
       <button class="smallBtn" onclick="window.open('${capture.iq_url}', '_blank')">Download IQ</button>
     </div>
     ${img}
   </div>`;
+}
+
+function showCaptureArtifact(captureId, url, kind) {
+  const img = document.getElementById(`capture-img-${captureId}`);
+  const caption = document.getElementById(`capture-caption-${captureId}`);
+  if (!img || !caption) return;
+  img.dataset.currentUrl = url;
+  img.src = `${url}?t=${Date.now()}`;
+  if (kind === 'animation') {
+    img.alt = 'Animated spectrum view';
+    caption.textContent = 'Animated spectrum: each frame is about 1 second. X axis is frequency, Y axis is relative strength. Download IQ is the raw radio sample file for later demodulation/classification.';
+  } else {
+    img.alt = 'Spectrogram view';
+    caption.textContent = 'Spectrogram: time and frequency are shown together, with color indicating strength. Download IQ is the raw radio sample file for later demodulation/classification.';
+  }
+}
+
+function openCaptureArtifact(captureId) {
+  const img = document.getElementById(`capture-img-${captureId}`);
+  if (img?.dataset.currentUrl) window.open(img.dataset.currentUrl, '_blank');
 }
 
 async function loadCaptures() {
