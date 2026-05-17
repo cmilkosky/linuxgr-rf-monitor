@@ -1,0 +1,11 @@
+[Unit]
+Description=Publish RF Monitor status to Home Assistant every minute
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=60s
+AccuracySec=10s
+Unit=rf-ha-status.service
+
+[Install]
+WantedBy=timers.target

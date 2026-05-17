@@ -1,0 +1,16 @@
+[Unit]
+Description=RF Monitor web console
+After=network-online.target influxdb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cmilkosk
+WorkingDirectory=/home/cmilkosk/rf-monitor
+Environment=RF_MONITOR_ENV=/home/cmilkosk/.config/hackrf-influx.env
+ExecStart=/usr/bin/python3 -m uvicorn rf_monitor_console:app --host 0.0.0.0 --port 8099
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

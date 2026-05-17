@@ -1,0 +1,21 @@
+[Unit]
+Description=RF Monitor anomaly detector
+After=network-online.target influxdb.service hackrf-influx.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cmilkosk
+WorkingDirectory=/home/cmilkosk/rf-monitor
+Environment=RF_MONITOR_ENV=/home/cmilkosk/.config/hackrf-influx.env
+Environment=RF_ANOMALY_INTERVAL=60
+Environment=RF_BASELINE_HOURS=6
+Environment=RF_RECENT_MINUTES=3
+Environment=RF_ANOMALY_DELTA_DB=18
+Environment=RF_ANOMALY_MIN_RSSI_DB=-55
+ExecStart=/usr/bin/python3 /home/cmilkosk/rf-monitor/rf_anomaly_detector.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
