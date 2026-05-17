@@ -218,16 +218,17 @@ def parse_hackrf_sweep_line(line: str) -> list[dict[str, float]]:
 def parse_hackrf_sweep_frames(output: str, low_hz: int, high_hz: int) -> list[list[dict[str, float]]]:
     frames: list[list[dict[str, float]]] = []
     current: list[dict[str, float]] = []
-    last_low_hz: int | None = None
+    current_ranges: set[int] = set()
     for line in output.splitlines():
         row = parse_hackrf_sweep_row(line)
         if not row:
             continue
-        if current and last_low_hz is not None and row["low_hz"] <= last_low_hz:
+        if current and row["low_hz"] in current_ranges:
             frames.append(sorted(current, key=lambda item: item["frequency_hz"]))
             current = []
+            current_ranges = set()
         current.extend(point for point in row["points"] if low_hz <= point["frequency_hz"] <= high_hz)
-        last_low_hz = row["low_hz"]
+        current_ranges.add(row["low_hz"])
     if current:
         frames.append(sorted(current, key=lambda item: item["frequency_hz"]))
     return [frame for frame in frames if frame]
