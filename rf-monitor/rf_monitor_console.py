@@ -232,6 +232,22 @@ def find_peak_points(points: list[dict[str, float]], limit: int = 5) -> list[dic
     return peaks
 
 
+def frequency_gap_ranges(points: list[dict[str, float]]) -> list[tuple[float, float]]:
+    if len(points) < 2:
+        return []
+    widths = [float(point.get("bin_width_hz", 0)) for point in points if point.get("bin_width_hz", 0)]
+    expected_hz = statistics.median(widths) if widths else 0
+    if expected_hz <= 0:
+        return []
+    threshold_hz = expected_hz * 2.5
+    gaps = []
+    for previous, current in zip(points, points[1:]):
+        delta_hz = current["frequency_hz"] - previous["frequency_hz"]
+        if delta_hz > threshold_hz:
+            gaps.append((previous["frequency_mhz"], current["frequency_mhz"]))
+    return gaps
+
+
 def draw_focused_scan_frame(
     Image: Any,
     ImageDraw: Any,
@@ -267,13 +283,26 @@ def draw_focused_scan_frame(
     draw.text((16, top + plot_h // 2 + 22), "dB", fill=(156, 170, 181))
     span = max(0.001, max_mhz - min_mhz)
     db_span = max(1.0, high_db - low_db)
+    gaps = frequency_gap_ranges(points)
+    for gap_start, gap_end in gaps:
+        x1 = left + ((gap_start - min_mhz) / span) * plot_w
+        x2 = left + ((gap_end - min_mhz) / span) * plot_w
+        draw.rectangle((x1, top, x2, top + plot_h), fill=(23, 29, 34), outline=(54, 66, 75))
     line = []
+    segments = []
+    gap_starts = {gap[1] for gap in gaps}
     for point in points:
         x = left + ((point["frequency_mhz"] - min_mhz) / span) * plot_w
         y = top + (1 - max(0, min(1, (point["rssi_db"] - low_db) / db_span))) * plot_h
+        if point["frequency_mhz"] in gap_starts and line:
+            segments.append(line)
+            line = []
         line.append((float(x), float(y)))
-    if len(line) > 1:
-        draw.line(line, fill=(255, 202, 98), width=2)
+    if line:
+        segments.append(line)
+    for segment in segments:
+        if len(segment) > 1:
+            draw.line(segment, fill=(255, 202, 98), width=2)
     peaks = find_peak_points(points, 4)
     for idx, peak in enumerate(peaks):
         x = left + ((peak["frequency_mhz"] - min_mhz) / span) * plot_w
@@ -284,7 +313,8 @@ def draw_focused_scan_frame(
         label_y = max(top + 4, int(y) - 18 - (idx % 2) * 16)
         draw.rectangle((label_x - 4, label_y - 2, label_x + 106, label_y + 13), fill=(16, 20, 24), outline=(255, 111, 145))
         draw.text((label_x, label_y), label, fill=(231, 237, 242))
-    draw.text((left, height - 52), f"Span {span_mhz} MHz   Peaks labelled by MHz", fill=(156, 170, 181))
+    gap_note = f"   Gaps {len(gaps)}" if gaps else ""
+    draw.text((left, height - 52), f"Span {span_mhz} MHz   Peaks labelled by MHz{gap_note}", fill=(156, 170, 181))
     return img
 
 
@@ -344,6 +374,7 @@ def run_deep_scan(center_frequency_hz: int, span_mhz: int, bin_width_hz: int) ->
             raise RuntimeError("hackrf_sweep returned no usable bins")
         peak = max(points, key=lambda item: item["rssi_db"])
         peaks = find_peak_points(points, 5)
+        gaps = [gap for frame in frames for gap in frequency_gap_ranges(frame)]
         write_focused_scan_gif(scan_id, frames, center_frequency_hz, span_mhz)
         return {
             "id": scan_id,
@@ -359,6 +390,8 @@ def run_deep_scan(center_frequency_hz: int, span_mhz: int, bin_width_hz: int) ->
             "points": points,
             "peak": peak,
             "peaks": peaks,
+            "gap_count": len(gaps),
+            "frequency_gaps_mhz": [{"start_mhz": start, "end_mhz": end} for start, end in gaps],
             "frame_count": len(frames),
             "animation_url": f"/api/deep-scans/{scan_id}/animation",
             "command": command,
@@ -1410,13 +1443,28 @@ function drawDeepScan() {
     ctx.lineTo(left + plotW, y);
     ctx.stroke();
   }
+  const widths = pts.map(p => Number(p.bin_width_hz || 0)).filter(Boolean).sort((a,b)=>a-b);
+  const expectedHz = widths.length ? widths[Math.floor(widths.length / 2)] : 0;
+  const gapStarts = new Set();
+  for (let i=1; i<pts.length; i++) {
+    const deltaHz = pts[i].frequency_hz - pts[i-1].frequency_hz;
+    if (expectedHz && deltaHz > expectedHz * 2.5) {
+      gapStarts.add(i);
+      const x1 = left + ((pts[i-1].frequency_mhz - minFreq) / Math.max(0.0001, maxFreq - minFreq)) * plotW;
+      const x2 = left + ((pts[i].frequency_mhz - minFreq) / Math.max(0.0001, maxFreq - minFreq)) * plotW;
+      ctx.fillStyle = 'rgba(35,45,52,0.72)';
+      ctx.fillRect(x1, top, Math.max(2, x2 - x1), plotH);
+      ctx.strokeStyle = '#36424b';
+      ctx.strokeRect(x1, top, Math.max(2, x2 - x1), plotH);
+    }
+  }
   ctx.strokeStyle = '#ffca62';
   ctx.lineWidth = 1.5;
   ctx.beginPath();
   pts.forEach((p, i) => {
     const x = left + ((p.frequency_mhz - minFreq) / Math.max(0.0001, maxFreq - minFreq)) * plotW;
     const y = top + (1 - ((p.rssi_db - minDb) / Math.max(1, maxDb - minDb))) * plotH;
-    if (i === 0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    if (i === 0 || gapStarts.has(i)) ctx.moveTo(x,y); else ctx.lineTo(x,y);
   });
   ctx.stroke();
   const peak = deepScanData.peak;
@@ -1463,9 +1511,10 @@ async function runFocusedScan(freq=selectedFreqHz) {
     if (!response.ok) throw new Error(data.detail || data.error || 'Focused scan failed');
     deepScanData = data;
     const peak = data.peak;
+    const gapNote = data.gap_count ? ` · ${data.gap_count} gap${data.gap_count === 1 ? '' : 's'} marked` : '';
     document.getElementById('deepScanStatus').innerHTML =
       `<b>${data.center_frequency_mhz.toFixed(3)} MHz focused scan</b><br>` +
-      `<span class="muted">${data.points.length} bins · ${data.bin_width_khz.toFixed(0)} kHz · ${data.frame_count || 1} frames · peak ${peak.frequency_mhz.toFixed(6)} MHz at ${peak.rssi_db.toFixed(1)} dB</span>`;
+      `<span class="muted">${data.points.length} bins · ${data.bin_width_khz.toFixed(0)} kHz · ${data.frame_count || 1} frames${gapNote} · peak ${peak.frequency_mhz.toFixed(6)} MHz at ${peak.rssi_db.toFixed(1)} dB</span>`;
     document.getElementById('deepScanMedia').innerHTML =
       `<img class="deepScanImg" ondblclick="window.open('${data.animation_url}', '_blank')" src="${data.animation_url}?t=${encodeURIComponent(data.completed_at)}" alt="Animated focused scan around ${data.center_frequency_mhz.toFixed(3)} MHz">` +
       `<div class="captureActions"><button class="smallBtn" onclick="window.open('${data.animation_url}', '_blank')">View Larger</button></div>` +
