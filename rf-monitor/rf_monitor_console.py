@@ -237,6 +237,52 @@ def ensure_gif_still(gif_path: Path) -> Path:
     return still_path
 
 
+def animation_viewer_html(title: str, animation_url: str, still_url: str) -> str:
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{title}</title>
+  <style>
+    :root {{ color-scheme: dark; --bg:#0c1013; --panel:#141b20; --line:#2b353d; --text:#e7edf2; --muted:#9caab5; --accent:#63d2ff; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; min-height:100vh; background:var(--bg); color:var(--text); font-family:Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; display:flex; flex-direction:column; }}
+    header {{ display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 16px; background:#10161a; border-bottom:1px solid var(--line); }}
+    h1 {{ margin:0; font-size:16px; }}
+    .controls {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }}
+    button, a {{ background:#202a31; color:var(--text); border:1px solid #35424c; border-radius:6px; padding:7px 10px; font:inherit; text-decoration:none; cursor:pointer; }}
+    button:hover, a:hover {{ border-color:var(--accent); }}
+    main {{ flex:1; display:flex; align-items:center; justify-content:center; padding:14px; }}
+    img {{ max-width:100%; max-height:calc(100vh - 86px); border:1px solid var(--line); border-radius:8px; background:#050708; }}
+    .muted {{ color:var(--muted); font-size:12px; }}
+  </style>
+</head>
+<body>
+  <header>
+    <div><h1>{title}</h1><div id="state" class="muted">Playing</div></div>
+    <div class="controls">
+      <button id="toggle">Pause</button>
+      <a href="{animation_url}" target="_blank">Raw GIF</a>
+    </div>
+  </header>
+  <main><img id="preview" src="{animation_url}" alt="{title}"></main>
+  <script>
+    const img = document.getElementById('preview');
+    const toggle = document.getElementById('toggle');
+    const state = document.getElementById('state');
+    let playing = true;
+    toggle.addEventListener('click', () => {{
+      playing = !playing;
+      img.src = `${{playing ? '{animation_url}' : '{still_url}'}}?t=${{Date.now()}}`;
+      toggle.textContent = playing ? 'Pause' : 'Play';
+      state.textContent = playing ? 'Playing' : 'Paused';
+    }});
+  </script>
+</body>
+</html>"""
+
+
 def find_peak_points(points: list[dict[str, float]], limit: int = 5) -> list[dict[str, float]]:
     if not points:
         return []
@@ -414,6 +460,7 @@ def run_deep_scan(center_frequency_hz: int, span_mhz: int, bin_width_hz: int) ->
             "frame_count": len(frames),
             "animation_url": f"/api/deep-scans/{scan_id}/animation",
             "still_url": f"/api/deep-scans/{scan_id}/still",
+            "viewer_url": f"/api/deep-scans/{scan_id}/viewer",
             "command": command,
             "sweep_was_active": sweep_was_active,
         }
@@ -443,6 +490,7 @@ def capture_record(meta_path: Path) -> dict[str, Any]:
     data["spectrogram_url"] = f"/api/captures/{capture_id}/spectrogram"
     data["animation_url"] = f"/api/captures/{capture_id}/animation"
     data["animation_still_url"] = f"/api/captures/{capture_id}/animation-still"
+    data["animation_viewer_url"] = f"/api/captures/{capture_id}/animation-viewer"
     data["audio_urls"] = {
         "am": f"/api/captures/{capture_id}/audio/am",
         "nfm": f"/api/captures/{capture_id}/audio/nfm",
@@ -985,6 +1033,17 @@ def deep_scan_still(scan_id: str) -> FileResponse:
     return FileResponse(path, media_type="image/png")
 
 
+@app.get("/api/deep-scans/{scan_id}/viewer", response_class=HTMLResponse)
+def deep_scan_viewer(scan_id: str) -> str:
+    gif_path = deep_scan_path(scan_id, ".gif")
+    ensure_gif_still(gif_path)
+    return animation_viewer_html(
+        "Focused scan animation",
+        f"/api/deep-scans/{scan_id}/animation",
+        f"/api/deep-scans/{scan_id}/still",
+    )
+
+
 @app.get("/api/captures/{capture_id}/meta")
 def capture_meta(capture_id: str) -> JSONResponse:
     path = capture_path(capture_id, ".json")
@@ -1041,6 +1100,32 @@ def capture_animation_still(capture_id: str) -> FileResponse:
         )
         meta_path.write_text(json.dumps(meta, indent=2))
     return FileResponse(ensure_gif_still(path), media_type="image/png")
+
+
+@app.get("/api/captures/{capture_id}/animation-viewer", response_class=HTMLResponse)
+def capture_animation_viewer(capture_id: str) -> str:
+    path = capture_path(capture_id, ".gif")
+    if not path.exists():
+        meta_path = capture_path(capture_id, ".json")
+        iq_path = capture_path(capture_id, ".iq")
+        png_path = capture_path(capture_id, ".png")
+        if not meta_path.exists() or not iq_path.exists():
+            raise HTTPException(404, "Animation not found")
+        meta = json.loads(meta_path.read_text())
+        meta["analysis"] = summarize_iq(
+            iq_path,
+            int(meta["sample_rate_hz"]),
+            int(meta["frequency_hz"]),
+            png_path,
+            path,
+        )
+        meta_path.write_text(json.dumps(meta, indent=2))
+    ensure_gif_still(path)
+    return animation_viewer_html(
+        "Capture animation",
+        f"/api/captures/{capture_id}/animation",
+        f"/api/captures/{capture_id}/animation-still",
+    )
 
 
 @app.get("/api/captures/{capture_id}/audio/{mode}")
@@ -1584,8 +1669,8 @@ async function runFocusedScan(freq=selectedFreqHz) {
       `<span class="muted">${data.points.length} bins · ${data.bin_width_khz.toFixed(0)} kHz · ${data.frame_count || 1} frames${gapNote} · peak ${peak.frequency_mhz.toFixed(6)} MHz at ${peak.rssi_db.toFixed(1)} dB</span>`;
     const deepImgId = `deep-scan-img-${data.id}`;
     document.getElementById('deepScanMedia').innerHTML =
-      `<div class="mediaShell"><img id="${deepImgId}" class="deepScanImg" data-playing="true" data-animation-url="${data.animation_url}" data-still-url="${data.still_url}" onclick="toggleGifPreview('${deepImgId}')" ondblclick="window.open('${data.animation_url}', '_blank')" src="${data.animation_url}?t=${encodeURIComponent(data.completed_at)}" alt="Animated focused scan around ${data.center_frequency_mhz.toFixed(3)} MHz"><span id="${deepImgId}-pill" class="pausePill">Playing</span></div>` +
-      `<div class="captureActions"><button class="smallBtn" onclick="toggleGifPreview('${deepImgId}')">Play / Pause</button><button class="smallBtn" onclick="window.open('${data.animation_url}', '_blank')">View Larger</button></div>` +
+      `<div class="mediaShell"><img id="${deepImgId}" class="deepScanImg" data-playing="true" data-animation-url="${data.animation_url}" data-still-url="${data.still_url}" onclick="toggleGifPreview('${deepImgId}')" ondblclick="window.open('${data.viewer_url}', '_blank')" src="${data.animation_url}?t=${encodeURIComponent(data.completed_at)}" alt="Animated focused scan around ${data.center_frequency_mhz.toFixed(3)} MHz"><span id="${deepImgId}-pill" class="pausePill">Playing</span></div>` +
+      `<div class="captureActions"><button class="smallBtn" onclick="toggleGifPreview('${deepImgId}')">Play / Pause</button><button class="smallBtn" onclick="window.open('${data.viewer_url}', '_blank')">View Larger</button></div>` +
       focusedPeakHtml(data);
     drawDeepScan();
   } catch (err) {
@@ -1667,7 +1752,7 @@ function captureItemHtml(capture) {
       <button class="smallBtn" onclick="showCaptureArtifact('${capture.id}', '${capture.animation_url}', 'animation')">Animation</button>
       <button class="smallBtn" onclick="showCaptureArtifact('${capture.id}', '${capture.spectrogram_url}', 'spectrogram')">Spectrogram</button>
     </div>
-    <div class="mediaShell"><img id="capture-img-${capture.id}" class="captureImg" onclick="toggleGifPreview('capture-img-${capture.id}')" ondblclick="openCaptureArtifact('${capture.id}')" data-playing="true" data-animation-url="${capture.animation_url}" data-still-url="${capture.animation_still_url}" data-current-url="${capture.animation_url}" src="${capture.animation_url}?t=${encodeURIComponent(capture.completed_at || capture.started_at)}" alt="Animated spectrum for ${capture.frequency_mhz.toFixed(3)} MHz capture"><span id="capture-img-${capture.id}-pill" class="pausePill">Playing</span></div>
+    <div class="mediaShell"><img id="capture-img-${capture.id}" class="captureImg" onclick="toggleGifPreview('capture-img-${capture.id}')" ondblclick="window.open('${capture.animation_viewer_url}', '_blank')" data-playing="true" data-animation-url="${capture.animation_url}" data-still-url="${capture.animation_still_url}" data-current-url="${capture.animation_url}" src="${capture.animation_url}?t=${encodeURIComponent(capture.completed_at || capture.started_at)}" alt="Animated spectrum for ${capture.frequency_mhz.toFixed(3)} MHz capture"><span id="capture-img-${capture.id}-pill" class="pausePill">Playing</span></div>
     <div id="capture-caption-${capture.id}" class="captureCaption">Animated spectrum: each frame is about 1 second. X axis is frequency, Y axis is relative strength. Download IQ is the raw radio sample file for later demodulation/classification.</div>
     <div class="audioPreview">
       <div class="audioRow"><span>AM</span><audio controls preload="metadata"><source src="${audioSrc('am')}" type="audio/wav"></audio><a class="audioLink" href="${audioSrc('am')}" target="_blank">Open</a></div>
@@ -1683,7 +1768,7 @@ function captureItemHtml(capture) {
     <div class="captureActions">
       <button class="smallBtn" onclick="selectFrequency(${capture.frequency_hz})">Select</button>
       <button class="smallBtn" onclick="toggleGifPreview('capture-img-${capture.id}')">Play / Pause</button>
-      <button class="smallBtn" onclick="window.open('${capture.animation_url}', '_blank')">View Animation</button>
+      <button class="smallBtn" onclick="window.open('${capture.animation_viewer_url}', '_blank')">View Animation</button>
       <button class="smallBtn" onclick="window.open('${capture.spectrogram_url}', '_blank')">View Spectrogram</button>
       <button class="smallBtn" onclick="window.open('${capture.meta_url}', '_blank')">Details</button>
       <button class="smallBtn" onclick="window.open('${capture.iq_url}', '_blank')">Download IQ</button>
