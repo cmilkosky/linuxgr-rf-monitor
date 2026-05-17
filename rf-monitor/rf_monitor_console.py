@@ -46,17 +46,20 @@ app = FastAPI(title="RF Monitor Console")
 
 
 def flux_query(query: str) -> list[dict[str, str]]:
-    response = requests.post(
-        f"{INFLUX_URL}/api/v2/query",
-        params={"org": INFLUX_ORG},
-        headers={
-            "Authorization": f"Token {INFLUX_TOKEN}",
-            "Accept": "application/csv",
-            "Content-Type": "application/vnd.flux",
-        },
-        data=query,
-        timeout=30,
-    )
+    try:
+        response = requests.post(
+            f"{INFLUX_URL}/api/v2/query",
+            params={"org": INFLUX_ORG},
+            headers={
+                "Authorization": f"Token {INFLUX_TOKEN}",
+                "Accept": "application/csv",
+                "Content-Type": "application/vnd.flux",
+            },
+            data=query,
+            timeout=75,
+        )
+    except requests.Timeout as exc:
+        raise HTTPException(504, "InfluxDB query timed out; try a shorter range or wider frequency bin") from exc
     if response.status_code >= 400:
         raise HTTPException(response.status_code, response.text)
     rows: list[dict[str, str]] = []
@@ -766,7 +769,7 @@ HTML = r"""<!doctype html>
 <main>
   <section>
     <div class="toolbar">
-      <label>Range <select id="hours"><option>1</option><option selected>3</option><option>6</option><option>12</option><option>24</option></select> h</label>
+      <label>Range <select id="hours"><option selected>1</option><option>3</option><option>6</option><option>12</option><option>24</option></select> h</label>
       <label>Frequency bin <select id="freqStep"><option>1</option><option selected>5</option><option>10</option><option>25</option><option>50</option></select> MHz</label>
       <button id="refresh">Refresh</button>
       <button id="resetZoom">Reset Zoom</button>
@@ -1044,27 +1047,61 @@ function drawDetail(data) {
   });
 }
 
-async function load() {
-  document.getElementById('statusText').textContent = 'Loading heatmap';
-  const hours = document.getElementById('hours').value;
+async function load(quick=false) {
+  document.getElementById('statusText').textContent = quick ? 'Loading quick heatmap' : 'Loading heatmap';
+  const selectedHours = document.getElementById('hours').value;
+  const hours = quick && zoomMinHz === null && zoomMaxHz === null ? '0.25' : selectedHours;
   const step = document.getElementById('freqStep').value;
+  const bucket = Number(hours) <= 1 ? '1m' : Number(hours) <= 6 ? '3m' : '5m';
   const zoomParams = zoomMinHz !== null && zoomMaxHz !== null ? `&freq_min_hz=${zoomMinHz}&freq_max_hz=${zoomMaxHz}` : '';
-  heatData = await fetch(`/api/heatmap?hours=${hours}&freq_step_mhz=${step}${zoomParams}`).then(r=>r.json());
-  document.getElementById('sweeps').textContent = heatData.points ?? 0;
-  document.getElementById('maxRssi').textContent = heatData.max == null ? '--' : `${heatData.max.toFixed(1)} dB`;
-  drawHeatmap();
-  const status = await fetch('/api/status').then(r=>r.json());
-  document.getElementById('activeAnoms').textContent = status.anomalies_active ?? 0;
-  document.getElementById('statusText').textContent = `Last update ${new Date(status.updated_at || Date.now()).toLocaleString()}`;
-  const anoms = await fetch('/api/anomalies?limit=12').then(r=>r.json());
-  document.getElementById('anomalies').innerHTML = (anoms.items || []).map(a =>
-    `<div class="item" onclick="selectFrequency(${a.frequency_hz})"><b>${(a.frequency_hz/1e6).toFixed(3)} MHz</b><br>${a.delta_db.toFixed(1)} dB over baseline · ${a.rssi_db.toFixed(1)} dB<br><span class="muted">${a.detected_at}</span></div>`
-  ).join('') || '<div class="muted">No anomalies yet. Baseline is warming up.</div>';
-  const top = await fetch('/api/top?hours=1&limit=12').then(r=>r.json());
-  document.getElementById('top').innerHTML = (top.items || []).map(a =>
-    `<div class="item" onclick="selectFrequency(${a.frequency_hz})"><b>${a.frequency_mhz.toFixed(3)} MHz</b><br>${a.rssi_db.toFixed(1)} dB<br><span class="muted">${a.time}</span></div>`
-  ).join('');
+  try {
+    const response = await fetch(`/api/heatmap?hours=${hours}&freq_step_mhz=${step}&time_bucket=${bucket}${zoomParams}`);
+    if (!response.ok) {
+      const detail = await response.text();
+      throw new Error(detail || `Heatmap request failed: ${response.status}`);
+    }
+    heatData = await response.json();
+    document.getElementById('sweeps').textContent = heatData.points ?? 0;
+    document.getElementById('maxRssi').textContent = heatData.max == null ? '--' : `${heatData.max.toFixed(1)} dB`;
+    drawHeatmap();
+    document.getElementById('statusText').textContent = `${quick ? 'Quick heatmap' : 'Heatmap'} updated ${new Date().toLocaleTimeString()}`;
+  } catch (err) {
+    document.getElementById('statusText').textContent = heatData ? `Heatmap refresh failed; showing previous data` : 'Heatmap load failed';
+    if (!heatData) {
+      const {ctx, width, height} = resizeCanvas(heat);
+      ctx.clearRect(0,0,width,height);
+      ctx.fillStyle = '#9caab5';
+      ctx.font = '14px system-ui';
+      ctx.fillText('Heatmap query is still warming up or timed out. Try 1 h / 10-25 MHz, then Refresh.', 24, 34);
+    }
+  }
+  loadStatusPanels();
   loadCaptures();
+}
+
+async function initialLoad() {
+  await load(true);
+  load(false);
+}
+
+async function loadStatusPanels() {
+  try {
+    const status = await fetch('/api/status').then(r=>r.json());
+    document.getElementById('activeAnoms').textContent = status.anomalies_active ?? 0;
+    if (status.updated_at) document.getElementById('statusText').textContent = `Last update ${new Date(status.updated_at).toLocaleString()}`;
+  } catch (err) {}
+  try {
+    const anoms = await fetch('/api/anomalies?limit=12').then(r=>r.json());
+    document.getElementById('anomalies').innerHTML = (anoms.items || []).map(a =>
+      `<div class="item" onclick="selectFrequency(${a.frequency_hz})"><b>${(a.frequency_hz/1e6).toFixed(3)} MHz</b><br>${a.delta_db.toFixed(1)} dB over baseline · ${a.rssi_db.toFixed(1)} dB<br><span class="muted">${a.detected_at}</span></div>`
+    ).join('') || '<div class="muted">No anomalies yet. Baseline is warming up.</div>';
+  } catch (err) {}
+  try {
+    const top = await fetch('/api/top?hours=1&limit=12').then(r=>r.json());
+    document.getElementById('top').innerHTML = (top.items || []).map(a =>
+      `<div class="item" onclick="selectFrequency(${a.frequency_hz})"><b>${a.frequency_mhz.toFixed(3)} MHz</b><br>${a.rssi_db.toFixed(1)} dB<br><span class="muted">${a.time}</span></div>`
+    ).join('');
+  } catch (err) {}
 }
 
 function captureItemHtml(capture) {
@@ -1121,10 +1158,14 @@ function openCaptureArtifact(captureId) {
 }
 
 async function loadCaptures() {
-  const data = await fetch('/api/captures?limit=4').then(r=>r.json());
-  captureRunning = data.capture_running;
-  document.getElementById('captureBtn').disabled = captureRunning || selectedFreqHz === null;
-  document.getElementById('captures').innerHTML = (data.items || []).map(captureItemHtml).join('') || '<div class="muted">No captures yet.</div>';
+  try {
+    const data = await fetch('/api/captures?limit=4').then(r=>r.json());
+    captureRunning = data.capture_running;
+    document.getElementById('captureBtn').disabled = captureRunning || selectedFreqHz === null;
+    document.getElementById('captures').innerHTML = (data.items || []).map(captureItemHtml).join('') || '<div class="muted">No captures yet.</div>';
+  } catch (err) {
+    document.getElementById('captures').innerHTML = '<div class="muted">Capture list unavailable.</div>';
+  }
 }
 
 async function captureSelected() {
@@ -1195,7 +1236,7 @@ document.getElementById('resetZoom').addEventListener('click', resetZoom);
 document.getElementById('captureBtn').addEventListener('click', captureSelected);
 document.getElementById('hours').addEventListener('change', load);
 document.getElementById('freqStep').addEventListener('change', () => { resetZoom(); });
-load();
+initialLoad();
 loadCaptures();
 setInterval(load, 60000);
 setInterval(loadCaptures, 60000);
