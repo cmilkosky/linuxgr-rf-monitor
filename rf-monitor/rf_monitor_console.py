@@ -20,6 +20,7 @@ from typing import Any
 import requests
 from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from rf_signal_intel import classify_signal
 
 
 CONFIG_PATH = Path(os.environ.get("RF_MONITOR_ENV", "/home/cmilkosk/.config/hackrf-influx.env"))
@@ -979,6 +980,23 @@ from(bucket: "{INFLUX_BUCKET}")
     )
 
 
+@app.post("/api/identify")
+def identify_signal(payload: dict[str, Any] = Body(...)) -> JSONResponse:
+    frequency_hz = int(payload.get("frequency_hz", 0))
+    if frequency_hz < 1_000_000 or frequency_hz > 6_000_000_000:
+        raise HTTPException(400, "frequency_hz is outside the supported identification range")
+    status_doc = read_status()
+    anomaly = None
+    for item in status_doc.get("latest_anomalies", []):
+        if int(item.get("frequency_hz", -1)) == frequency_hz:
+            anomaly = item
+            break
+    report = classify_signal(frequency_hz, {"anomaly": anomaly} if anomaly else {})
+    report["source"] = "manual"
+    report["generated_at"] = datetime.now(timezone.utc).isoformat()
+    return JSONResponse(report)
+
+
 @app.get("/api/captures")
 def captures(limit: int = Query(12, ge=1, le=100)) -> JSONResponse:
     CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1203,6 +1221,10 @@ HTML = r"""<!doctype html>
     .mediaShell { position:relative; }
     .pausePill { position:absolute; right:8px; top:18px; padding:4px 7px; border-radius:6px; background:rgba(16,20,24,0.86); color:var(--text); border:1px solid var(--line); font-size:12px; pointer-events:none; }
     .peakList { color:var(--muted); font-size:12px; line-height:1.45; margin-top:8px; }
+    .intelBox { margin-top:12px; border:1px solid var(--line); background:var(--panel); border-radius:8px; padding:10px; }
+    .intelBox h4 { margin:0 0 6px; font-size:13px; }
+    .meter { height:7px; border-radius:999px; background:#202a31; overflow:hidden; margin:7px 0; }
+    .meter span { display:block; height:100%; background:linear-gradient(90deg,#63d2ff,#ffca62); }
     .audioPreview { margin-top:10px; display:flex; flex-direction:column; gap:8px; }
     .audioRow { display:grid; grid-template-columns: 42px 1fr 44px; align-items:center; gap:8px; color:var(--muted); font-size:12px; }
     .audioLink { color:var(--accent); text-decoration:none; font-size:12px; }
@@ -1240,6 +1262,7 @@ HTML = r"""<!doctype html>
         <label>Span <select id="deepSpan"><option value="10">10 MHz</option><option value="20" selected>20 MHz</option><option value="50">50 MHz</option></select></label>
         <label>Bin <select id="deepBin"><option value="25000">25 kHz</option><option value="50000">50 kHz</option><option value="100000" selected>100 kHz</option><option value="250000">250 kHz</option></select></label>
         <button id="deepScanBtn" class="primaryBtn" disabled>Focused Scan</button>
+        <button id="identifyBtn" disabled>Identify Signal</button>
       </div>
       <div class="toolbarGroup">
         <label>Seconds <select id="captureSeconds"><option>2</option><option selected>4</option><option>8</option><option>12</option></select></label>
@@ -1271,6 +1294,10 @@ HTML = r"""<!doctype html>
       <canvas id="deepScanCanvas" class="panel"></canvas>
       <div id="deepScanMedia"></div>
       <div class="hint">Focused scans briefly pause the wide sweep and take a high-resolution look around the selected frequency. They are animated snapshots, separate from the always-on 1 MHz baseline.</div>
+    </div>
+    <div class="intelBox">
+      <h4>Signal ID</h4>
+      <div id="signalIntel" class="muted">Select a frequency, then run Identify Signal.</div>
     </div>
     <div class="contextBox">
       <h4>Frequency Context</h4>
@@ -1534,12 +1561,47 @@ async function selectFrequency(freq) {
   selectedFreqHz = freq;
   document.getElementById('captureBtn').disabled = captureRunning ? true : false;
   document.getElementById('deepScanBtn').disabled = deepScanRunning ? true : false;
+  document.getElementById('identifyBtn').disabled = false;
   document.getElementById('toolbarSelected').textContent = `${(freq/1e6).toFixed(3)} MHz`;
   document.getElementById('selected').innerHTML = `<b>${(freq/1e6).toFixed(3)} MHz</b><br><span class="muted">Loading detail...</span>`;
   updateBandContext(freq);
   const data = await fetch(`/api/frequency/${freq}?hours=6&span_mhz=2`).then(r=>r.json());
   document.getElementById('selected').innerHTML = `<b>${(freq/1e6).toFixed(3)} MHz</b><br><span class="muted">Nearest bins: ${Object.keys(data.series).length}<br>Context: ${bandSummary(freq)}</span>`;
   drawDetail(data);
+}
+
+function signalIntelHtml(report) {
+  const bands = (report.bands || []).map(b => `<span class="tag">${b.name}</span>`).join('');
+  const reasons = (report.reasons || []).map(reason => `<li>${reason}</li>`).join('');
+  const actions = (report.next_actions || []).map(action => `<li>${action}</li>`).join('');
+  return `<b>${report.frequency_mhz.toFixed(3)} MHz</b><br>` +
+    `<span class="muted">${report.likely} · ${report.confidence} confidence</span>` +
+    `<div class="meter"><span style="width:${Math.max(0, Math.min(100, report.interestingness || 0))}%"></span></div>` +
+    `<span class="muted">Interestingness ${report.interestingness || 0}/100</span>` +
+    (bands ? `<div class="tagList">${bands}</div>` : '') +
+    (reasons ? `<div class="hint"><b>Why</b><ul>${reasons}</ul></div>` : '') +
+    (actions ? `<div class="hint"><b>Next</b><ul>${actions}</ul></div>` : '') +
+    `<div class="hint">${report.note || ''}</div>`;
+}
+
+async function identifySelected() {
+  if (!selectedFreqHz) return;
+  const activity = showActivity('Identifying');
+  document.getElementById('signalIntel').innerHTML = `<b>${(selectedFreqHz/1e6).toFixed(3)} MHz</b><br><span class="muted">Building signal report...</span>`;
+  try {
+    const response = await fetch('/api/identify', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({frequency_hz: selectedFreqHz})
+    });
+    const report = await response.json();
+    if (!response.ok) throw new Error(report.detail || 'Identification failed');
+    document.getElementById('signalIntel').innerHTML = signalIntelHtml(report);
+  } catch (err) {
+    document.getElementById('signalIntel').innerHTML = `<b>Identification failed</b><br><span class="muted">${err.message}</span>`;
+  } finally {
+    hideActivity(activity);
+  }
 }
 
 function drawDetail(data) {
@@ -1737,7 +1799,7 @@ async function loadStatusPanels() {
   try {
     const anoms = await fetch('/api/anomalies?limit=12').then(r=>r.json());
     document.getElementById('anomalies').innerHTML = (anoms.items || []).map(a =>
-      `<div class="item" onclick="selectFrequency(${a.frequency_hz})"><b>${(a.frequency_hz/1e6).toFixed(3)} MHz</b><br>${a.delta_db.toFixed(1)} dB over baseline · ${a.rssi_db.toFixed(1)} dB<br><span class="muted">${a.detected_at}</span></div>`
+      `<div class="item" onclick="selectFrequency(${a.frequency_hz})"><b>${(a.frequency_hz/1e6).toFixed(3)} MHz</b><br>${a.delta_db.toFixed(1)} dB over baseline · ${a.rssi_db.toFixed(1)} dB<br><span class="muted">${a.signal_intel ? `${a.signal_intel.likely} · interest ${a.signal_intel.interestingness}/100` : a.detected_at}</span></div>`
     ).join('') || '<div class="muted">No anomalies yet. Baseline is warming up.</div>';
   } catch (err) {}
   try {
@@ -1899,6 +1961,7 @@ document.getElementById('refresh').addEventListener('click', () => load(false, '
 document.getElementById('resetZoom').addEventListener('click', resetZoom);
 document.getElementById('captureBtn').addEventListener('click', captureSelected);
 document.getElementById('deepScanBtn').addEventListener('click', () => runFocusedScan());
+document.getElementById('identifyBtn').addEventListener('click', identifySelected);
 document.getElementById('hours').addEventListener('change', load);
 document.getElementById('freqStep').addEventListener('change', () => { resetZoom(); });
 initialLoad();

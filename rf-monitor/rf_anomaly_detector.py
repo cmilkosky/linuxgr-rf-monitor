@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
+from rf_signal_intel import classify_signal
 
 
 CONFIG_PATH = Path(os.environ.get("RF_MONITOR_ENV", "/home/cmilkosk/.config/hackrf-influx.env"))
@@ -138,6 +139,7 @@ join(tables: {{baseline: baseline, recent: recent}}, on: ["frequency_hz"])
             "delta_db": float(row["delta_db"]),
             "detected_at": now.isoformat(),
         }
+        anomaly["signal_intel"] = classify_signal(freq, {"anomaly": anomaly})
         anomalies.append(anomaly)
         tags = f"source={line_escape(ENV.get('RF_SOURCE', 'hackrf_linuxgr'))},frequency_hz={freq}"
         fields = (
