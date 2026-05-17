@@ -21,6 +21,7 @@ flowchart LR
     Sweep --> Collector["hackrf_influx_collector.py"]
     Collector --> Influx["InfluxDB OSS v2<br/>bucket: rf_monitoring"]
     Influx --> Console["RF Monitor Console<br/>FastAPI + Canvas UI<br/>port 8099"]
+    Console --> Capture["On-demand IQ capture<br/>hackrf_transfer + spectrogram PNG"]
     Influx --> Detector["RF Anomaly Detector<br/>rolling baseline"]
     Detector --> Influx
     Detector --> Status["status.json"]
@@ -37,6 +38,7 @@ sequenceDiagram
     participant Collector as Collector service
     participant DB as InfluxDB v2
     participant UI as RF Console
+    participant Cap as Capture
     participant Anom as Anomaly Detector
     participant HA as Home Assistant
 
@@ -45,6 +47,7 @@ sequenceDiagram
     Sweep-->>Collector: CSV rows with RSSI bins
     Collector->>DB: write rf_sweep points
     UI->>DB: query heatmap/top/drilldown windows
+    UI->>Cap: pause sweep, capture selected frequency, render spectrogram
     Anom->>DB: query baseline and recent peaks
     Anom->>DB: write rf_anomaly events
     Anom->>HA: publish MQTT status
@@ -76,7 +79,23 @@ Main endpoints:
 - `/api/frequency/{frequency_hz}` - neighboring-bin drilldown
 - `/api/top` - strongest recent bins
 - `/api/anomalies` - current anomaly list
+- `/api/capture` - on-demand HackRF IQ capture for a selected frequency
+- `/api/captures` - recent capture records and generated artifacts
 - `/api/health` - Influx/service health
+
+The console can capture a selected signal from the sidebar. A capture briefly pauses `hackrf-influx`, runs `hackrf_transfer`, stores raw unsigned 8-bit interleaved I/Q samples, generates a spectrogram PNG, then resumes the wideband sweep. The first deployed capture mode is intentionally conservative: short IQ captures with metadata and visual inspection before demodulation or classification.
+
+Capture artifacts live on linuxGR under:
+
+```text
+/home/cmilkosk/rf-monitor/captures
+```
+
+Each capture produces:
+
+- `{capture_id}.iq` - raw HackRF I/Q samples
+- `{capture_id}.json` - frequency, sample rate, gain, command output, and analysis metadata
+- `{capture_id}.png` - quick-look spectrogram
 
 ### Anomaly Detector
 
@@ -182,8 +201,9 @@ This UI needs to be RF-native:
 - Hover a heatmap block to read frequency, time, and RSSI
 - Click a hot block to zoom into that frequency range
 - Use the selected-frequency panel to drill into adjacent bins
+- Capture raw IQ around a selected frequency
+- Generate quick-look spectrograms for signal investigation
 - Show anomaly overlays/events
-- Eventually trigger IQ capture around a selected frequency
 
 Home Assistant remains the home-automation surface for status and alerts.
 
@@ -194,13 +214,13 @@ Near-term:
 - Add visible anomaly overlays to the heatmap
 - Add presets for common bands
 - Add CSV/PNG export for a selected frequency window
+- Add capture notes and labels so interesting signals become an investigation log
 - Tune anomaly thresholds after a few days of baseline data
 
 Next phase:
 
-- Capture IQ around clicked/anomalous frequencies
-- Generate waterfall/spectrogram artifacts
-- Add signal investigation records
+- Add demodulation attempts for obvious analog voice/narrow FM captures
+- Add signal investigation records with capture comparisons over time
 - Connect known signal references such as Artemis/SigID
 
 Later:

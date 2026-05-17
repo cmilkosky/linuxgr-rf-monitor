@@ -10,6 +10,7 @@ These notes describe the current `linuxGR` deployment.
 /home/cmilkosk/rf-monitor/rf_monitor_console.py
 /home/cmilkosk/rf-monitor/rf_anomaly_detector.py
 /home/cmilkosk/rf-monitor/publish_rf_ha_status.py
+/home/cmilkosk/rf-monitor/captures/
 ```
 
 ## Services
@@ -27,8 +28,15 @@ sudo systemctl enable --now rf-ha-status.timer
 ```bash
 curl http://127.0.0.1:8099/api/health
 curl 'http://127.0.0.1:8099/api/heatmap?hours=0.25&freq_step_mhz=25'
+curl http://127.0.0.1:8099/api/captures
 systemctl is-active influxdb hackrf-influx rf-monitor-console rf-anomaly-detector rf-ha-status.timer
 ```
+
+## Signal Capture
+
+The RF console can capture a selected frequency with `hackrf_transfer`. During capture it pauses `hackrf-influx`, records raw I/Q, writes metadata, generates a spectrogram PNG, and restarts the sweep service.
+
+Capture artifacts are stored in `/home/cmilkosk/rf-monitor/captures/`.
 
 ## Home Assistant
 

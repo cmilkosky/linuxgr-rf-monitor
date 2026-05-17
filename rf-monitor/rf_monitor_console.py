@@ -5,19 +5,23 @@ import csv
 import io
 import json
 import os
+import subprocess
 import statistics
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import requests
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 
 CONFIG_PATH = Path(os.environ.get("RF_MONITOR_ENV", "/home/cmilkosk/.config/hackrf-influx.env"))
 STATUS_PATH = Path(os.environ.get("RF_MONITOR_STATUS", "/home/cmilkosk/rf-monitor/status.json"))
+CAPTURE_DIR = Path(os.environ.get("RF_CAPTURE_DIR", "/home/cmilkosk/rf-monitor/captures"))
+CAPTURE_LOCK = threading.Lock()
 
 
 def load_env(path: Path = CONFIG_PATH) -> dict[str, str]:
@@ -81,6 +85,208 @@ def flux_duration(value: float, unit: str) -> str:
     seconds_per_unit = {"h": 3600, "m": 60}[unit]
     seconds = max(1, round(value * seconds_per_unit))
     return f"{seconds}s"
+
+
+def run_command(command: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(command, text=True, capture_output=True, timeout=timeout, check=False)
+
+
+def systemctl(action: str, service: str) -> subprocess.CompletedProcess[str]:
+    return run_command(["sudo", "systemctl", action, service], timeout=90)
+
+
+def service_state(service: str) -> str:
+    result = run_command(["systemctl", "is-active", service], timeout=10)
+    return result.stdout.strip() or "unknown"
+
+
+def service_is_active(service: str) -> bool:
+    return service_state(service) == "active"
+
+
+def wait_for_service_state(service: str, desired: set[str], timeout_seconds: int) -> bool:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if service_state(service) in desired:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def pause_sweep_service() -> bool:
+    if not service_is_active("hackrf-influx.service"):
+        return False
+    run_command(["sudo", "systemctl", "stop", "--no-block", "hackrf-influx.service"], timeout=10)
+    if wait_for_service_state("hackrf-influx.service", {"inactive", "failed", "unknown"}, 45):
+        return True
+    run_command(["sudo", "systemctl", "kill", "hackrf-influx.service"], timeout=10)
+    wait_for_service_state("hackrf-influx.service", {"inactive", "failed", "unknown"}, 10)
+    run_command(["sudo", "systemctl", "reset-failed", "hackrf-influx.service"], timeout=10)
+    return True
+
+
+def resume_sweep_service() -> None:
+    run_command(["sudo", "systemctl", "start", "--no-block", "hackrf-influx.service"], timeout=10)
+    wait_for_service_state("hackrf-influx.service", {"active"}, 30)
+
+
+def capture_path(capture_id: str, suffix: str) -> Path:
+    safe_id = "".join(ch for ch in capture_id if ch.isalnum() or ch in "-_")
+    if safe_id != capture_id:
+        raise HTTPException(400, "Invalid capture id")
+    return CAPTURE_DIR / f"{safe_id}{suffix}"
+
+
+def capture_record(meta_path: Path) -> dict[str, Any]:
+    data = json.loads(meta_path.read_text())
+    capture_id = data["id"]
+    data["meta_url"] = f"/api/captures/{capture_id}/meta"
+    data["iq_url"] = f"/api/captures/{capture_id}/iq"
+    data["spectrogram_url"] = f"/api/captures/{capture_id}/spectrogram"
+    return data
+
+
+def summarize_iq(iq_path: Path, sample_rate_hz: int, center_frequency_hz: int, png_path: Path) -> dict[str, Any]:
+    import numpy as np
+    from PIL import Image, ImageDraw
+
+    raw = np.fromfile(iq_path, dtype=np.uint8)
+    if raw.size < 4096:
+        raise RuntimeError("Capture file was too small to analyze")
+    raw = raw[: raw.size - (raw.size % 2)]
+    iq = (raw[0::2].astype(np.float32) - 127.5) + 1j * (raw[1::2].astype(np.float32) - 127.5)
+    iq /= 128.0
+
+    usable = iq[: min(iq.size, sample_rate_hz * 5)]
+    nfft = 2048
+    if usable.size < nfft:
+        raise RuntimeError("Capture file was too short for an FFT")
+    target_columns = 1000
+    hop = max(512, (usable.size - nfft) // target_columns)
+    starts = np.arange(0, usable.size - nfft + 1, hop, dtype=np.int64)
+    window = np.hanning(nfft).astype(np.float32)
+    spectra = np.empty((nfft, starts.size), dtype=np.float32)
+    for col, start in enumerate(starts):
+        chunk = usable[start : start + nfft] * window
+        spectra[:, col] = np.abs(np.fft.fftshift(np.fft.fft(chunk))).astype(np.float32)
+    freqs = np.fft.fftshift(np.fft.fftfreq(nfft, d=1.0 / sample_rate_hz))
+    power_db = 20 * np.log10(spectra + 1e-12)
+    peak_index = np.unravel_index(np.argmax(power_db), power_db.shape)
+    low = float(np.percentile(power_db, 5))
+    high = float(np.percentile(power_db, 99.5))
+    norm = np.clip((power_db - low) / max(1e-6, high - low), 0, 1)
+    img_array = np.zeros((norm.shape[0], norm.shape[1], 3), dtype=np.uint8)
+    img_array[..., 0] = np.clip(255 * np.minimum(1, norm * 2.1), 0, 255)
+    img_array[..., 1] = np.clip(255 * np.maximum(0, (norm - 0.22) * 1.55), 0, 255)
+    img_array[..., 2] = np.clip(255 * np.maximum(0, 1.0 - norm * 2.6), 0, 255)
+    img_array = np.flipud(img_array)
+    resample = getattr(getattr(Image, "Resampling", Image), "BILINEAR")
+    heatmap = Image.fromarray(img_array, mode="RGB").resize((920, 420), resample)
+    canvas = Image.new("RGB", (1100, 560), (16, 20, 24))
+    canvas.paste(heatmap, (120, 56))
+    draw = ImageDraw.Draw(canvas)
+    draw.text((22, 18), f"{center_frequency_hz / 1_000_000:.3f} MHz IQ capture", fill=(231, 237, 242))
+    draw.text((120, 492), "Seconds", fill=(156, 170, 181))
+    draw.text((18, 246), "Frequency", fill=(156, 170, 181))
+    draw.text((24, 58), f"{(center_frequency_hz + sample_rate_hz / 2) / 1_000_000:.3f} MHz", fill=(156, 170, 181))
+    draw.text((24, 462), f"{(center_frequency_hz - sample_rate_hz / 2) / 1_000_000:.3f} MHz", fill=(156, 170, 181))
+    draw.text((120, 502), "0.0", fill=(156, 170, 181))
+    draw.text((970, 502), f"{usable.size / sample_rate_hz:.1f}s", fill=(156, 170, 181))
+    draw.rectangle((119, 55, 1041, 477), outline=(43, 53, 61))
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(png_path)
+
+    mean_power = float(20 * np.log10(np.sqrt(np.mean(np.abs(usable) ** 2)) + 1e-12))
+    return {
+        "samples": int(iq.size),
+        "duration_seconds": round(iq.size / sample_rate_hz, 3),
+        "mean_power_dbfs": round(mean_power, 2),
+        "peak_frequency_hz": int(center_frequency_hz + freqs[peak_index[0]]),
+        "peak_frequency_mhz": round((center_frequency_hz + freqs[peak_index[0]]) / 1_000_000, 6),
+    }
+
+
+def capture_signal(
+    frequency_hz: int,
+    duration_seconds: int,
+    sample_rate_hz: int,
+    lna_gain_db: int,
+    vga_gain_db: int,
+    amp_enable: int,
+) -> dict[str, Any]:
+    if not CAPTURE_LOCK.acquire(blocking=False):
+        raise HTTPException(409, "A capture is already running")
+    sweep_was_active = service_is_active("hackrf-influx.service")
+    capture_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"-{frequency_hz}"
+    iq_path = capture_path(capture_id, ".iq")
+    png_path = capture_path(capture_id, ".png")
+    meta_path = capture_path(capture_id, ".json")
+    sample_count = int(duration_seconds * sample_rate_hz)
+    command = [
+        "hackrf_transfer",
+        "-r",
+        str(iq_path),
+        "-f",
+        str(frequency_hz),
+        "-s",
+        str(sample_rate_hz),
+        "-n",
+        str(sample_count),
+        "-a",
+        str(amp_enable),
+        "-l",
+        str(lna_gain_db),
+        "-g",
+        str(vga_gain_db),
+    ]
+    started_at = datetime.now(timezone.utc)
+    meta: dict[str, Any] = {
+        "id": capture_id,
+        "status": "running",
+        "started_at": started_at.isoformat(),
+        "frequency_hz": frequency_hz,
+        "frequency_mhz": frequency_hz / 1_000_000,
+        "duration_seconds": duration_seconds,
+        "sample_rate_hz": sample_rate_hz,
+        "sample_count": sample_count,
+        "lna_gain_db": lna_gain_db,
+        "vga_gain_db": vga_gain_db,
+        "amp_enable": amp_enable,
+        "sweep_was_active": sweep_was_active,
+        "command": command,
+    }
+    try:
+        CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(json.dumps(meta, indent=2))
+        if sweep_was_active:
+            pause_sweep_service()
+            time.sleep(1.0)
+        result = run_command(command, timeout=duration_seconds + 20)
+        meta["hackrf_transfer_stdout"] = result.stdout[-4000:]
+        meta["hackrf_transfer_stderr"] = result.stderr[-4000:]
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"hackrf_transfer exited with {result.returncode}")
+        if not iq_path.exists() or iq_path.stat().st_size == 0:
+            raise RuntimeError("hackrf_transfer did not create a capture file")
+        meta["iq_bytes"] = iq_path.stat().st_size
+        meta["analysis"] = summarize_iq(iq_path, sample_rate_hz, frequency_hz, png_path)
+        meta["status"] = "complete"
+        meta["completed_at"] = datetime.now(timezone.utc).isoformat()
+        meta_path.write_text(json.dumps(meta, indent=2))
+        return capture_record(meta_path)
+    except Exception as exc:
+        meta["status"] = "failed"
+        meta["error"] = str(exc)
+        meta["completed_at"] = datetime.now(timezone.utc).isoformat()
+        meta_path.write_text(json.dumps(meta, indent=2))
+        raise HTTPException(500, str(exc)) from exc
+    finally:
+        if sweep_was_active:
+            try:
+                resume_sweep_service()
+            except Exception:
+                pass
+        CAPTURE_LOCK.release()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -225,6 +431,63 @@ from(bucket: "{INFLUX_BUCKET}")
     )
 
 
+@app.get("/api/captures")
+def captures(limit: int = Query(12, ge=1, le=100)) -> JSONResponse:
+    CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+    records = [capture_record(path) for path in sorted(CAPTURE_DIR.glob("*.json"), reverse=True)[:limit]]
+    return JSONResponse({"items": records, "capture_running": CAPTURE_LOCK.locked()})
+
+
+@app.post("/api/capture")
+def capture(
+    payload: dict[str, Any] = Body(...),
+) -> JSONResponse:
+    frequency_hz = int(payload.get("frequency_hz", 0))
+    if frequency_hz < 1_000_000 or frequency_hz > 6_000_000_000:
+        raise HTTPException(400, "frequency_hz is outside the supported capture range")
+    duration_seconds = int(payload.get("duration_seconds", 4))
+    sample_rate_hz = int(payload.get("sample_rate_hz", 5_000_000))
+    lna_gain_db = int(payload.get("lna_gain_db", 32))
+    vga_gain_db = int(payload.get("vga_gain_db", 24))
+    amp_enable = int(payload.get("amp_enable", 0))
+    if duration_seconds < 1 or duration_seconds > 20:
+        raise HTTPException(400, "duration_seconds must be between 1 and 20")
+    if sample_rate_hz < 2_000_000 or sample_rate_hz > 20_000_000:
+        raise HTTPException(400, "sample_rate_hz must be between 2 MHz and 20 MHz")
+    if lna_gain_db not in range(0, 41, 8):
+        raise HTTPException(400, "lna_gain_db must be 0-40 dB in 8 dB steps")
+    if vga_gain_db < 0 or vga_gain_db > 62 or vga_gain_db % 2:
+        raise HTTPException(400, "vga_gain_db must be 0-62 dB in 2 dB steps")
+    if amp_enable not in (0, 1):
+        raise HTTPException(400, "amp_enable must be 0 or 1")
+    record = capture_signal(frequency_hz, duration_seconds, sample_rate_hz, lna_gain_db, vga_gain_db, amp_enable)
+    return JSONResponse(record)
+
+
+@app.get("/api/captures/{capture_id}/meta")
+def capture_meta(capture_id: str) -> JSONResponse:
+    path = capture_path(capture_id, ".json")
+    if not path.exists():
+        raise HTTPException(404, "Capture not found")
+    return JSONResponse(capture_record(path))
+
+
+@app.get("/api/captures/{capture_id}/spectrogram")
+def capture_spectrogram(capture_id: str) -> FileResponse:
+    path = capture_path(capture_id, ".png")
+    if not path.exists():
+        raise HTTPException(404, "Spectrogram not found")
+    return FileResponse(path, media_type="image/png")
+
+
+@app.get("/api/captures/{capture_id}/iq")
+def capture_iq(capture_id: str) -> FileResponse:
+    path = capture_path(capture_id, ".iq")
+    if not path.exists():
+        raise HTTPException(404, "IQ capture not found")
+    return FileResponse(path, media_type="application/octet-stream", filename=path.name)
+
+
 HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -244,6 +507,9 @@ HTML = r"""<!doctype html>
     select, button { background:#202a31; color:var(--text); border:1px solid #35424c; border-radius:6px; padding:7px 10px; font:inherit; }
     button { cursor:pointer; }
     button:hover { border-color:var(--accent); }
+    button:disabled { opacity:0.55; cursor:not-allowed; }
+    .primaryBtn { background:#1d4050; border-color:#39758f; }
+    .smallBtn { padding:5px 8px; font-size:12px; }
     .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; }
     #heatmapWrap { height: calc(100vh - 150px); min-height: 520px; padding:10px; }
     canvas { display:block; width:100%; height:100%; }
@@ -262,6 +528,8 @@ HTML = r"""<!doctype html>
     .contextBox h4 { margin:0 0 6px; font-size:13px; }
     .tagList { display:flex; flex-wrap:wrap; gap:6px; margin-top:7px; }
     .tag { border:1px solid #35424c; border-radius:999px; padding:3px 7px; font-size:12px; color:var(--text); background:#202a31; }
+    .captureActions { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:10px; }
+    .captureImg { width:100%; border:1px solid var(--line); border-radius:8px; margin-top:8px; background:#0c1013; }
     #zoomState { color: var(--hot); }
     #detailCanvas { height:220px; margin-top:10px; }
     @media (max-width: 1000px) { main { grid-template-columns: 1fr; } aside { border-left:0; border-top:1px solid var(--line); } #heatmapWrap { height: 60vh; } }
@@ -300,6 +568,17 @@ HTML = r"""<!doctype html>
       <div id="bandContext" class="muted">Hover the colored rail or a heatmap block.</div>
       <div class="hint">Reference ranges are approximate and meant for orientation, not as an authoritative band plan.</div>
     </div>
+    <h3>Capture</h3>
+    <div class="contextBox">
+      <div id="captureStatus" class="muted">Select a frequency to capture raw IQ and create a spectrogram.</div>
+      <div class="captureActions">
+        <label>Seconds <select id="captureSeconds"><option>2</option><option selected>4</option><option>8</option><option>12</option></select></label>
+        <label>Rate <select id="captureRate"><option value="2000000">2 Msps</option><option value="5000000" selected>5 Msps</option><option value="10000000">10 Msps</option></select></label>
+        <button id="captureBtn" class="primaryBtn" disabled>Capture Signal</button>
+      </div>
+      <div class="hint">Capture briefly pauses the wideband sweep, records HackRF IQ around the selected frequency, then resumes sweeping.</div>
+    </div>
+    <div id="captures" class="list"></div>
     <h3>Anomalies</h3>
     <div id="anomalies" class="list"></div>
     <h3>Top Signals</h3>
@@ -314,6 +593,8 @@ let hoverCell = null;
 let hoverFreqHz = null;
 let zoomMinHz = null;
 let zoomMaxHz = null;
+let selectedFreqHz = null;
+let captureRunning = false;
 
 const BAND_REFS = [
   {name:'UHF', min:300, max:3000, info:'Broad 300-3000 MHz band. Your current sweep sees the 400-3000 MHz portion.'},
@@ -511,6 +792,8 @@ function resetZoom() {
 }
 
 async function selectFrequency(freq) {
+  selectedFreqHz = freq;
+  document.getElementById('captureBtn').disabled = captureRunning ? true : false;
   document.getElementById('selected').innerHTML = `<b>${(freq/1e6).toFixed(3)} MHz</b><br><span class="muted">Loading detail...</span>`;
   updateBandContext(freq);
   const data = await fetch(`/api/frequency/${freq}?hours=6&span_mhz=2`).then(r=>r.json());
@@ -558,6 +841,60 @@ async function load() {
   document.getElementById('top').innerHTML = (top.items || []).map(a =>
     `<div class="item" onclick="selectFrequency(${a.frequency_hz})"><b>${a.frequency_mhz.toFixed(3)} MHz</b><br>${a.rssi_db.toFixed(1)} dB<br><span class="muted">${a.time}</span></div>`
   ).join('');
+  loadCaptures();
+}
+
+function captureItemHtml(capture) {
+  const analysis = capture.analysis || {};
+  const status = capture.status === 'complete' ? 'Complete' : capture.status;
+  const img = capture.status === 'complete' ? `<img class="captureImg" src="${capture.spectrogram_url}?t=${encodeURIComponent(capture.completed_at || capture.started_at)}" alt="Spectrogram for ${capture.frequency_mhz.toFixed(3)} MHz capture">` : '';
+  const peak = analysis.peak_frequency_mhz ? `<br>Peak ${analysis.peak_frequency_mhz.toFixed(6)} MHz` : '';
+  return `<div class="item">
+    <b>${capture.frequency_mhz.toFixed(3)} MHz</b><br>
+    ${status} · ${capture.duration_seconds}s @ ${(capture.sample_rate_hz/1e6).toFixed(0)} Msps${peak}<br>
+    <span class="muted">${capture.started_at}</span>
+    <div class="captureActions">
+      <button class="smallBtn" onclick="selectFrequency(${capture.frequency_hz})">Select</button>
+      <button class="smallBtn" onclick="window.open('${capture.meta_url}', '_blank')">Metadata</button>
+      <button class="smallBtn" onclick="window.open('${capture.iq_url}', '_blank')">IQ</button>
+    </div>
+    ${img}
+  </div>`;
+}
+
+async function loadCaptures() {
+  const data = await fetch('/api/captures?limit=4').then(r=>r.json());
+  captureRunning = data.capture_running;
+  document.getElementById('captureBtn').disabled = captureRunning || selectedFreqHz === null;
+  document.getElementById('captures').innerHTML = (data.items || []).map(captureItemHtml).join('') || '<div class="muted">No captures yet.</div>';
+}
+
+async function captureSelected() {
+  if (!selectedFreqHz || captureRunning) return;
+  const seconds = Number(document.getElementById('captureSeconds').value);
+  const sampleRate = Number(document.getElementById('captureRate').value);
+  captureRunning = true;
+  document.getElementById('captureBtn').disabled = true;
+  document.getElementById('captureStatus').innerHTML = `<b>${(selectedFreqHz/1e6).toFixed(3)} MHz</b><br>Capturing ${seconds}s of IQ and building a spectrogram...`;
+  try {
+    const response = await fetch('/api/capture', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({frequency_hz: selectedFreqHz, duration_seconds: seconds, sample_rate_hz: sampleRate})
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || data.error || 'Capture failed');
+    const analysis = data.analysis || {};
+    document.getElementById('captureStatus').innerHTML =
+      `<b>Capture complete</b><br>${data.frequency_mhz.toFixed(3)} MHz · ${data.duration_seconds}s · peak ${analysis.peak_frequency_mhz?.toFixed(6) || '--'} MHz`;
+    loadCaptures();
+    load();
+  } catch (err) {
+    document.getElementById('captureStatus').innerHTML = `<b>Capture failed</b><br><span class="muted">${err.message}</span>`;
+  } finally {
+    captureRunning = false;
+    document.getElementById('captureBtn').disabled = selectedFreqHz === null;
+  }
 }
 
 heat.addEventListener('click', e => {
@@ -597,10 +934,13 @@ heat.addEventListener('mouseleave', () => {
 window.addEventListener('resize', () => { drawHeatmap(); if (heatData) drawHeatmap(); });
 document.getElementById('refresh').addEventListener('click', load);
 document.getElementById('resetZoom').addEventListener('click', resetZoom);
+document.getElementById('captureBtn').addEventListener('click', captureSelected);
 document.getElementById('hours').addEventListener('change', load);
 document.getElementById('freqStep').addEventListener('change', () => { resetZoom(); });
 load();
+loadCaptures();
 setInterval(load, 60000);
+setInterval(loadCaptures, 60000);
 </script>
 </body>
 </html>
