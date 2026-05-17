@@ -529,7 +529,8 @@ HTML = r"""<!doctype html>
     .tagList { display:flex; flex-wrap:wrap; gap:6px; margin-top:7px; }
     .tag { border:1px solid #35424c; border-radius:999px; padding:3px 7px; font-size:12px; color:var(--text); background:#202a31; }
     .captureActions { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:10px; }
-    .captureImg { width:100%; border:1px solid var(--line); border-radius:8px; margin-top:8px; background:#0c1013; }
+    .captureImg { width:100%; border:1px solid var(--line); border-radius:8px; margin-top:8px; background:#0c1013; cursor:zoom-in; }
+    .captureCaption { color:var(--muted); font-size:12px; line-height:1.35; margin-top:6px; }
     #zoomState { color: var(--hot); }
     #detailCanvas { height:220px; margin-top:10px; }
     @media (max-width: 1000px) { main { grid-template-columns: 1fr; } aside { border-left:0; border-top:1px solid var(--line); } #heatmapWrap { height: 60vh; } }
@@ -847,7 +848,9 @@ async function load() {
 function captureItemHtml(capture) {
   const analysis = capture.analysis || {};
   const status = capture.status === 'complete' ? 'Complete' : capture.status;
-  const img = capture.status === 'complete' ? `<img class="captureImg" src="${capture.spectrogram_url}?t=${encodeURIComponent(capture.completed_at || capture.started_at)}" alt="Spectrogram for ${capture.frequency_mhz.toFixed(3)} MHz capture">` : '';
+  const img = capture.status === 'complete' ? `
+    <img class="captureImg" onclick="window.open('${capture.spectrogram_url}', '_blank')" src="${capture.spectrogram_url}?t=${encodeURIComponent(capture.completed_at || capture.started_at)}" alt="Spectrogram for ${capture.frequency_mhz.toFixed(3)} MHz capture">
+    <div class="captureCaption">Quick-look spectrogram. Click the image or View Spectrogram for the full-size PNG. Download IQ is the raw radio sample file for later demodulation/classification.</div>` : '';
   const peak = analysis.peak_frequency_mhz ? `<br>Peak ${analysis.peak_frequency_mhz.toFixed(6)} MHz` : '';
   return `<div class="item">
     <b>${capture.frequency_mhz.toFixed(3)} MHz</b><br>
@@ -855,8 +858,9 @@ function captureItemHtml(capture) {
     <span class="muted">${capture.started_at}</span>
     <div class="captureActions">
       <button class="smallBtn" onclick="selectFrequency(${capture.frequency_hz})">Select</button>
-      <button class="smallBtn" onclick="window.open('${capture.meta_url}', '_blank')">Metadata</button>
-      <button class="smallBtn" onclick="window.open('${capture.iq_url}', '_blank')">IQ</button>
+      <button class="smallBtn" onclick="window.open('${capture.spectrogram_url}', '_blank')">View Spectrogram</button>
+      <button class="smallBtn" onclick="window.open('${capture.meta_url}', '_blank')">Details</button>
+      <button class="smallBtn" onclick="window.open('${capture.iq_url}', '_blank')">Download IQ</button>
     </div>
     ${img}
   </div>`;
