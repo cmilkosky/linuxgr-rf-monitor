@@ -257,6 +257,11 @@ HTML = r"""<!doctype html>
     .item b { color:var(--hot); }
     .muted { color:var(--muted); }
     .readout { color: var(--accent); font-weight: 600; min-width: 300px; }
+    .hint { color:var(--muted); font-size:12px; line-height:1.35; margin-top:8px; }
+    .contextBox { margin-top:12px; border:1px solid var(--line); background:var(--panel); border-radius:8px; padding:10px; }
+    .contextBox h4 { margin:0 0 6px; font-size:13px; }
+    .tagList { display:flex; flex-wrap:wrap; gap:6px; margin-top:7px; }
+    .tag { border:1px solid #35424c; border-radius:999px; padding:3px 7px; font-size:12px; color:var(--text); background:#202a31; }
     #zoomState { color: var(--hot); }
     #detailCanvas { height:220px; margin-top:10px; }
     @media (max-width: 1000px) { main { grid-template-columns: 1fr; } aside { border-left:0; border-top:1px solid var(--line); } #heatmapWrap { height: 60vh; } }
@@ -274,7 +279,7 @@ HTML = r"""<!doctype html>
       <label>Frequency bin <select id="freqStep"><option>1</option><option selected>5</option><option>10</option><option>25</option><option>50</option></select> MHz</label>
       <button id="refresh">Refresh</button>
       <button id="resetZoom">Reset Zoom</button>
-      <span class="muted" id="legend">Color = RSSI strength</span>
+      <span class="muted" id="legend">Color = RSSI strength; left rail = frequency context</span>
       <span id="hoverReadout" class="readout"></span>
       <span id="zoomState"></span>
     </div>
@@ -289,6 +294,12 @@ HTML = r"""<!doctype html>
     <h3>Selected</h3>
     <div id="selected" class="muted">Click a heatmap block.</div>
     <canvas id="detailCanvas" class="panel"></canvas>
+    <div class="hint">Detail graph: RSSI over the last 6 hours for the selected frequency and nearby bins. Each colored line is one neighboring bin; spikes mean that bin got stronger during that time.</div>
+    <div class="contextBox">
+      <h4>Frequency Context</h4>
+      <div id="bandContext" class="muted">Hover the colored rail or a heatmap block.</div>
+      <div class="hint">Reference ranges are approximate and meant for orientation, not as an authoritative band plan.</div>
+    </div>
     <h3>Anomalies</h3>
     <div id="anomalies" class="list"></div>
     <h3>Top Signals</h3>
@@ -300,8 +311,32 @@ const heat = document.getElementById('heatmap');
 const detail = document.getElementById('detailCanvas');
 let heatData = null;
 let hoverCell = null;
+let hoverFreqHz = null;
 let zoomMinHz = null;
 let zoomMaxHz = null;
+
+const BAND_REFS = [
+  {name:'UHF', min:300, max:3000, info:'Broad 300-3000 MHz band. Your current sweep sees the 400-3000 MHz portion.'},
+  {name:'L-band', min:1000, max:2000, info:'Satellite, GNSS, aircraft, and other microwave services often appear here.'},
+  {name:'S-band', min:2000, max:4000, info:'Microwave band with radar, satellite, Wi-Fi/ISM, and amateur allocations.'},
+  {name:'C-band', min:4000, max:8000, info:'Microwave band. Your current sweep sees the 4000-5995 MHz portion.'},
+  {name:'70 cm amateur', min:420, max:450, info:'Amateur radio allocation in the United States.'},
+  {name:'433 MHz ISM', min:433.05, max:434.79, info:'Short-range devices, sensors, remotes, and ISM activity.'},
+  {name:'902-928 MHz ISM', min:902, max:928, info:'ISM devices, LoRa, sensors, telemetry, and other unlicensed activity.'},
+  {name:'ADS-B / Mode S', min:1088, max:1092, info:'Aircraft transponder and ADS-B activity centered near 1090 MHz.'},
+  {name:'GPS L2 / GNSS', min:1220, max:1235, info:'GNSS downlink neighborhood around GPS L2.'},
+  {name:'23 cm amateur', min:1240, max:1300, info:'Amateur radio allocation in the United States.'},
+  {name:'GPS L1 / GNSS', min:1570, max:1580, info:'GNSS downlink neighborhood around GPS L1 at 1575.42 MHz.'},
+  {name:'L-band satcom', min:1525, max:1660, info:'Inmarsat and other mobile satellite downlink neighborhood.'},
+  {name:'L-band weather satellites', min:1670, max:1710, info:'Some polar-orbiting weather satellite HRPT-style downlinks are in this area; 137 MHz APT is below this sweep.'},
+  {name:'13 cm amateur', min:2300, max:2450, info:'Amateur allocation overlaps the 2.4 GHz ISM neighborhood.'},
+  {name:'2.4 GHz ISM / Wi-Fi', min:2400, max:2483.5, info:'Wi-Fi, Bluetooth, Zigbee, microwave ovens, and many ISM devices.'},
+  {name:'9 cm amateur', min:3300, max:3500, info:'Amateur microwave allocation.'},
+  {name:'C-band sat downlink', min:3700, max:4200, info:'Satellite downlink neighborhood; local licensing and repacking vary.'},
+  {name:'5 GHz Wi-Fi / U-NII', min:5150, max:5895, info:'Wi-Fi and U-NII activity, with exact allowed channels varying by region/device.'},
+  {name:'5.8 GHz ISM', min:5725, max:5875, info:'ISM neighborhood used by some video links, telemetry, and other devices.'},
+  {name:'5 cm amateur', min:5650, max:5925, info:'Amateur microwave allocation overlaps the 5 GHz Wi-Fi/ISM area.'}
+];
 
 function color(v, min, max) {
   if (v === null || Number.isNaN(v)) return '#11181d';
@@ -324,15 +359,74 @@ function resizeCanvas(canvas) {
   return {ctx, width: rect.width, height: rect.height};
 }
 
+function heatGeometry(width, height) {
+  return {left: 104, bottom: 28, top: 8, right: 10, railLeft: 72, railRight: 90};
+}
+
+function bandColor(idx, alpha=0.82) {
+  const palette = [
+    [99,210,255],[255,202,98],[123,216,143],[255,111,145],[199,146,234],
+    [93,176,255],[255,157,99],[128,225,196],[238,124,190]
+  ];
+  const c = palette[idx % palette.length];
+  return `rgba(${c[0]},${c[1]},${c[2]},${alpha})`;
+}
+
+function bandMatches(freqHz) {
+  const mhz = freqHz / 1e6;
+  return BAND_REFS.filter(b => mhz >= b.min && mhz <= b.max);
+}
+
+function bandSummary(freqHz) {
+  const matches = bandMatches(freqHz);
+  return matches.length ? matches.map(b => b.name).join(', ') : 'No reference range match';
+}
+
+function updateBandContext(freqHz) {
+  const el = document.getElementById('bandContext');
+  const matches = bandMatches(freqHz);
+  if (!matches.length) {
+    el.innerHTML = `<b>${(freqHz/1e6).toFixed(3)} MHz</b><br>No reference range match in the local list.`;
+    return;
+  }
+  el.innerHTML = `<b>${(freqHz/1e6).toFixed(3)} MHz</b><div class="tagList">` +
+    matches.map(b => `<span class="tag">${b.name}</span>`).join('') +
+    `</div><div class="hint">${matches.slice(0,3).map(b => b.info).join(' ')}</div>`;
+}
+
+function drawBandRail(ctx, geom, width, height, rows) {
+  if (!heatData || !rows) return;
+  const plotH = height - geom.top - geom.bottom;
+  const minMhz = Math.min(...heatData.frequencies_mhz);
+  const maxMhz = Math.max(...heatData.frequencies_mhz);
+  const span = Math.max(1, maxMhz - minMhz);
+  ctx.fillStyle = '#202a31';
+  ctx.fillRect(geom.railLeft, geom.top, geom.railRight - geom.railLeft, plotH);
+  BAND_REFS.forEach((band, idx) => {
+    const lo = Math.max(minMhz, band.min);
+    const hi = Math.min(maxMhz, band.max);
+    if (hi < lo) return;
+    const yHi = geom.top + (1 - ((hi - minMhz) / span)) * plotH;
+    const yLo = geom.top + (1 - ((lo - minMhz) / span)) * plotH;
+    const h = Math.max(2, yLo - yHi);
+    ctx.fillStyle = bandColor(idx, band.max - band.min > 500 ? 0.36 : 0.74);
+    ctx.fillRect(geom.railLeft, yHi, geom.railRight - geom.railLeft, h);
+  });
+  ctx.strokeStyle = '#35424c';
+  ctx.strokeRect(geom.railLeft, geom.top, geom.railRight - geom.railLeft, plotH);
+}
+
 function drawHeatmap() {
   const {ctx, width, height} = resizeCanvas(heat);
   ctx.clearRect(0,0,width,height);
   if (!heatData) return;
-  const left = 70, bottom = 28, top = 8, right = 10;
+  const geom = heatGeometry(width, height);
+  const {left, bottom, top, right} = geom;
   const rows = heatData.frequencies_hz.length;
   const cols = heatData.times.length;
   const cellW = (width-left-right) / Math.max(1, cols);
   const cellH = (height-top-bottom) / Math.max(1, rows);
+  drawBandRail(ctx, geom, width, height, rows);
   for (let r=0; r<rows; r++) {
     for (let c=0; c<cols; c++) {
       ctx.fillStyle = color(heatData.values[r][c], heatData.min ?? -90, heatData.max ?? -20);
@@ -350,6 +444,19 @@ function drawHeatmap() {
     ctx.lineWidth = 1;
     ctx.strokeRect(left + hoverCell.col*cellW, top + (rows-1-hoverCell.row)*cellH, Math.max(1, cellW), Math.max(1, cellH));
   }
+  if (hoverFreqHz) {
+    const idx = heatData.frequencies_hz.indexOf(hoverFreqHz);
+    if (idx >= 0) {
+      const y = top + (rows-1-idx)*cellH + cellH/2;
+      ctx.strokeStyle = '#e7edf2';
+      ctx.globalAlpha = 0.65;
+      ctx.beginPath();
+      ctx.moveTo(geom.railLeft - 4, y);
+      ctx.lineTo(width - right, y);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+  }
 }
 
 function heatCell(event) {
@@ -357,7 +464,8 @@ function heatCell(event) {
   const rect = heat.getBoundingClientRect();
   const x = event.clientX - rect.left;
   const y = event.clientY - rect.top;
-  const left = 70, bottom = 28, top = 8, right = 10;
+  const geom = heatGeometry(rect.width, rect.height);
+  const {left, bottom, top, right} = geom;
   const rows = heatData.frequencies_hz.length;
   const cols = heatData.times.length;
   const cellW = (rect.width-left-right) / Math.max(1, cols);
@@ -367,6 +475,21 @@ function heatCell(event) {
   const row = rows - 1 - rowInv;
   if (row < 0 || row >= rows || col < 0 || col >= cols) return null;
   return {row, col, freq: heatData.frequencies_hz[row], time: heatData.times[col], value: heatData.values[row][col]};
+}
+
+function railFrequency(event) {
+  if (!heatData) return null;
+  const rect = heat.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+  const geom = heatGeometry(rect.width, rect.height);
+  if (x < geom.railLeft || x > geom.railRight || y < geom.top || y > rect.height - geom.bottom) return null;
+  const rows = heatData.frequencies_hz.length;
+  const cellH = (rect.height-geom.top-geom.bottom) / Math.max(1, rows);
+  const rowInv = Math.floor((y-geom.top)/cellH);
+  const row = rows - 1 - rowInv;
+  if (row < 0 || row >= rows) return null;
+  return heatData.frequencies_hz[row];
 }
 
 function zoomAround(freq) {
@@ -381,6 +504,7 @@ function resetZoom() {
   zoomMinHz = null;
   zoomMaxHz = null;
   hoverCell = null;
+  hoverFreqHz = null;
   document.getElementById('zoomState').textContent = '';
   document.getElementById('hoverReadout').textContent = '';
   load();
@@ -388,8 +512,9 @@ function resetZoom() {
 
 async function selectFrequency(freq) {
   document.getElementById('selected').innerHTML = `<b>${(freq/1e6).toFixed(3)} MHz</b><br><span class="muted">Loading detail...</span>`;
+  updateBandContext(freq);
   const data = await fetch(`/api/frequency/${freq}?hours=6&span_mhz=2`).then(r=>r.json());
-  document.getElementById('selected').innerHTML = `<b>${(freq/1e6).toFixed(3)} MHz</b><br><span class="muted">Nearest bins: ${Object.keys(data.series).length}</span>`;
+  document.getElementById('selected').innerHTML = `<b>${(freq/1e6).toFixed(3)} MHz</b><br><span class="muted">Nearest bins: ${Object.keys(data.series).length}<br>Context: ${bandSummary(freq)}</span>`;
   drawDetail(data);
 }
 
@@ -437,25 +562,35 @@ async function load() {
 
 heat.addEventListener('click', e => {
   const cell = heatCell(e);
-  if (cell) {
-    zoomAround(cell.freq);
-    selectFrequency(cell.freq);
+  const railFreq = railFrequency(e);
+  const freq = cell ? cell.freq : railFreq;
+  if (freq) {
+    zoomAround(freq);
+    selectFrequency(freq);
     load();
   }
 });
 heat.addEventListener('mousemove', e => {
   hoverCell = heatCell(e);
-  if (!hoverCell) {
+  const railFreq = railFrequency(e);
+  hoverFreqHz = hoverCell ? hoverCell.freq : railFreq;
+  if (!hoverCell && !railFreq) {
     document.getElementById('hoverReadout').textContent = '';
     drawHeatmap();
     return;
   }
-  const rssi = hoverCell.value === null ? 'no data' : `${hoverCell.value.toFixed(1)} dB`;
-  document.getElementById('hoverReadout').textContent = `${(hoverCell.freq/1e6).toFixed(3)} MHz · ${rssi} · ${new Date(hoverCell.time).toLocaleTimeString()}`;
+  updateBandContext(hoverFreqHz);
+  if (hoverCell) {
+    const rssi = hoverCell.value === null ? 'no data' : `${hoverCell.value.toFixed(1)} dB`;
+    document.getElementById('hoverReadout').textContent = `${(hoverCell.freq/1e6).toFixed(3)} MHz · ${rssi} · ${new Date(hoverCell.time).toLocaleTimeString()} · ${bandSummary(hoverCell.freq)}`;
+  } else {
+    document.getElementById('hoverReadout').textContent = `${(railFreq/1e6).toFixed(3)} MHz · ${bandSummary(railFreq)}`;
+  }
   drawHeatmap();
 });
 heat.addEventListener('mouseleave', () => {
   hoverCell = null;
+  hoverFreqHz = null;
   document.getElementById('hoverReadout').textContent = '';
   drawHeatmap();
 });
