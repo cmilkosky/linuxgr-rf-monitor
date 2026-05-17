@@ -1340,15 +1340,13 @@ HTML = r"""<!doctype html>
     #activityOverlay.active { display:flex; }
     .activityBadge { width:190px; min-height:172px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; border:1px solid #38505d; border-radius:8px; background:rgba(18,24,29,0.94); box-shadow:0 18px 54px rgba(0,0,0,0.34); }
     .radioLoader { position:relative; width:132px; height:132px; }
-    .radioLoader::after { content:""; position:absolute; z-index:2; left:80px; top:18px; width:58px; height:98px; background:linear-gradient(90deg, rgba(16,20,24,0.86), rgba(16,20,24,0.98) 36%, rgba(16,20,24,0.94)); border-radius:0 10px 10px 0; pointer-events:none; }
-    .radioLoader .loaderDishFrame { position:absolute; left:14px; top:14px; z-index:1; width:84px; height:104px; border-radius:10px; overflow:hidden; filter:drop-shadow(0 12px 18px rgba(0,0,0,.38)); }
-    .radioLoader .loaderDish { width:104px; height:104px; object-fit:cover; object-position:left center; }
-    .radioLoader .radioWave { position:absolute; z-index:3; border:3px solid var(--accent); border-left-color:transparent; border-bottom-color:transparent; border-radius:50%; opacity:0; filter:drop-shadow(0 0 8px rgba(99,210,255,.75)); transform:rotate(8deg) scale(0.96); transform-origin:18% 78%; animation:radioPulse 1.45s infinite ease-in-out; }
-    .radioLoader .radioWave:nth-of-type(1) { left:80px; top:42px; width:24px; height:46px; animation-delay:0s; }
-    .radioLoader .radioWave:nth-of-type(2) { left:85px; top:31px; width:34px; height:68px; animation-delay:0.18s; opacity:0; }
-    .radioLoader .radioWave:nth-of-type(3) { left:90px; top:20px; width:45px; height:90px; animation-delay:0.36s; opacity:0; }
+    .radioLoader .loaderDish { position:absolute; left:14px; top:14px; z-index:1; width:104px; height:104px; border-radius:10px; object-fit:cover; object-position:center; filter:drop-shadow(0 12px 18px rgba(0,0,0,.38)); }
+    .radioLoader .radioWave { position:absolute; z-index:2; border:3px solid var(--accent); border-left-color:transparent; border-bottom-color:transparent; border-radius:50%; opacity:0; filter:drop-shadow(0 0 8px rgba(99,210,255,.75)); transform:rotate(36deg) scale(0.96); transform-origin:18% 78%; animation:radioPulse 1.45s infinite ease-in-out; }
+    .radioLoader .radioWave:nth-of-type(1) { left:82px; top:38px; width:24px; height:46px; animation-delay:0s; }
+    .radioLoader .radioWave:nth-of-type(2) { left:88px; top:24px; width:34px; height:68px; animation-delay:0.18s; opacity:0; }
+    .radioLoader .radioWave:nth-of-type(3) { left:94px; top:10px; width:45px; height:90px; animation-delay:0.36s; opacity:0; }
     .activityText { font-size:15px; font-weight:700; color:var(--text); text-transform:uppercase; letter-spacing:0; }
-    @keyframes radioPulse { 0% { opacity:0.05; transform:rotate(8deg) translate(0,0) scale(0.94); } 38% { opacity:0.95; } 100% { opacity:0.08; transform:rotate(8deg) translate(6px,-3px) scale(1.08); } }
+    @keyframes radioPulse { 0% { opacity:0.05; transform:rotate(36deg) translate(0,0) scale(0.92); } 38% { opacity:0.95; } 100% { opacity:0.08; transform:rotate(36deg) translate(7px,-7px) scale(1.1); } }
     @media (max-width: 1000px) { main { grid-template-columns: 1fr; } aside { border-left:0; border-top:1px solid var(--line); } #heatmapWrap { height: 60vh; } }
   </style>
 </head>
@@ -1426,7 +1424,7 @@ HTML = r"""<!doctype html>
   <div class="activityBadge">
     <div class="radioLoader">
       <span class="radioWave"></span><span class="radioWave"></span><span class="radioWave"></span>
-      <span class="loaderDishFrame"><img class="loaderDish" src="/assets/rf-dish-antenna.png" alt="" aria-hidden="true"></span>
+      <img class="loaderDish" src="/assets/rf-dish-antenna-loader.png" alt="" aria-hidden="true">
     </div>
     <div id="activityText" class="activityText">Working</div>
   </div>
