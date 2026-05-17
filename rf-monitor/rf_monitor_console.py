@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import csv
+import contextlib
+import fcntl
 import io
 import json
 import math
@@ -24,6 +26,7 @@ CONFIG_PATH = Path(os.environ.get("RF_MONITOR_ENV", "/home/cmilkosk/.config/hack
 STATUS_PATH = Path(os.environ.get("RF_MONITOR_STATUS", "/home/cmilkosk/rf-monitor/status.json"))
 CAPTURE_DIR = Path(os.environ.get("RF_CAPTURE_DIR", "/home/cmilkosk/rf-monitor/captures"))
 DEEP_SCAN_DIR = Path(os.environ.get("RF_DEEP_SCAN_DIR", "/home/cmilkosk/rf-monitor/deep-scans"))
+DEVICE_LOCK_PATH = Path(os.environ.get("RF_HACKRF_LOCK", "/tmp/hackrf-monitor-device.lock"))
 CAPTURE_LOCK = threading.Lock()
 DEEP_SCAN_LOCK = threading.Lock()
 
@@ -118,6 +121,25 @@ def bucket_time_iso(value: str, bucket_seconds: int) -> str:
 
 def run_command(command: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, text=True, capture_output=True, timeout=timeout, check=False)
+
+
+@contextlib.contextmanager
+def hackrf_device_lock(timeout_seconds: float = 90.0) -> Any:
+    DEVICE_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with DEVICE_LOCK_PATH.open("w") as lock_file:
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise RuntimeError("Timed out waiting for HackRF to become available")
+                time.sleep(0.25)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
 def systemctl(action: str, service: str) -> subprocess.CompletedProcess[str]:
@@ -417,13 +439,10 @@ def run_deep_scan(center_frequency_hz: int, span_mhz: int, bin_width_hz: int) ->
     high_mhz = math.ceil(high_hz / 1_000_000)
     scan_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"-{center_frequency_hz}"
     command = ["hackrf_sweep", "-N", "4", "-f", f"{low_mhz}:{high_mhz}", "-w", str(bin_width_hz)]
-    sweep_was_active = service_is_active("hackrf-influx.service")
     started_at = datetime.now(timezone.utc)
     try:
-        if sweep_was_active:
-            pause_sweep_service()
-            time.sleep(1.0)
-        result = run_command(command, timeout=90)
+        with hackrf_device_lock(95):
+            result = run_command(command, timeout=90)
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"hackrf_sweep exited with {result.returncode}")
         frames = parse_hackrf_sweep_frames(result.stdout, low_hz, high_hz)
@@ -462,16 +481,11 @@ def run_deep_scan(center_frequency_hz: int, span_mhz: int, bin_width_hz: int) ->
             "still_url": f"/api/deep-scans/{scan_id}/still",
             "viewer_url": f"/api/deep-scans/{scan_id}/viewer",
             "command": command,
-            "sweep_was_active": sweep_was_active,
+            "coordination": "waited_for_hackrf_device_lock",
         }
     except Exception as exc:
         raise HTTPException(500, str(exc)) from exc
     finally:
-        if sweep_was_active:
-            try:
-                resume_sweep_service()
-            except Exception:
-                pass
         DEEP_SCAN_LOCK.release()
 
 
@@ -748,7 +762,6 @@ def capture_signal(
 ) -> dict[str, Any]:
     if not CAPTURE_LOCK.acquire(blocking=False):
         raise HTTPException(409, "A capture is already running")
-    sweep_was_active = service_is_active("hackrf-influx.service")
     capture_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"-{frequency_hz}"
     iq_path = capture_path(capture_id, ".iq")
     png_path = capture_path(capture_id, ".png")
@@ -785,16 +798,14 @@ def capture_signal(
         "lna_gain_db": lna_gain_db,
         "vga_gain_db": vga_gain_db,
         "amp_enable": amp_enable,
-        "sweep_was_active": sweep_was_active,
+        "coordination": "waited_for_hackrf_device_lock",
         "command": command,
     }
     try:
         CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
         meta_path.write_text(json.dumps(meta, indent=2))
-        if sweep_was_active:
-            pause_sweep_service()
-            time.sleep(1.0)
-        result = run_command(command, timeout=duration_seconds + 20)
+        with hackrf_device_lock(duration_seconds + 90):
+            result = run_command(command, timeout=duration_seconds + 20)
         meta["hackrf_transfer_stdout"] = result.stdout[-4000:]
         meta["hackrf_transfer_stderr"] = result.stderr[-4000:]
         if result.returncode != 0:
@@ -818,11 +829,6 @@ def capture_signal(
         meta_path.write_text(json.dumps(meta, indent=2))
         raise HTTPException(500, str(exc)) from exc
     finally:
-        if sweep_was_active:
-            try:
-                resume_sweep_service()
-            except Exception:
-                pass
         CAPTURE_LOCK.release()
 
 

@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
+import fcntl
 import logging
 import os
 import shlex
@@ -201,6 +203,18 @@ def build_command(args: argparse.Namespace) -> list[str]:
     return command
 
 
+@contextlib.contextmanager
+def hackrf_device_lock(path: str) -> Iterable[None]:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as lock_file:
+        LOG.debug("waiting for HackRF device lock: %s", path)
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--hackrf-sweep", default=os.environ.get("HACKRF_SWEEP", "hackrf_sweep"))
@@ -214,6 +228,7 @@ def main() -> int:
     parser.add_argument("--measurement", default=os.environ.get("INFLUX_MEASUREMENT", "rf_sweep"))
     parser.add_argument("--source", default=os.environ.get("RF_SOURCE", "hackrf_linuxgr"))
     parser.add_argument("--timeout", type=float, default=float(os.environ.get("INFLUX_TIMEOUT", "10")))
+    parser.add_argument("--device-lock", default=os.environ.get("RF_HACKRF_LOCK", "/tmp/hackrf-monitor-device.lock"))
     parser.add_argument("--dry-run", action="store_true", default=os.environ.get("DRY_RUN") == "1")
     parser.add_argument("--once", action="store_true", help="run one sweep pass and exit")
     parser.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"))
@@ -230,11 +245,12 @@ def main() -> int:
     while not STOP:
         started = time.monotonic()
         batch: list[str] = []
-        for sweep_bin in run_sweep(command):
-            batch.append(to_line_protocol(args.measurement, args.source, sweep_bin))
-            if len(batch) >= args.batch_size:
-                flush(batch, args.dry_run, args.timeout)
-                batch.clear()
+        with hackrf_device_lock(args.device_lock):
+            for sweep_bin in run_sweep(command):
+                batch.append(to_line_protocol(args.measurement, args.source, sweep_bin))
+                if len(batch) >= args.batch_size:
+                    flush(batch, args.dry_run, args.timeout)
+                    batch.clear()
         flush(batch, args.dry_run, args.timeout)
         if args.once:
             break
