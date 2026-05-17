@@ -9,6 +9,7 @@ import subprocess
 import statistics
 import threading
 import time
+import wave
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -144,7 +145,99 @@ def capture_record(meta_path: Path) -> dict[str, Any]:
     data["iq_url"] = f"/api/captures/{capture_id}/iq"
     data["spectrogram_url"] = f"/api/captures/{capture_id}/spectrogram"
     data["animation_url"] = f"/api/captures/{capture_id}/animation"
+    data["audio_urls"] = {
+        "am": f"/api/captures/{capture_id}/audio/am",
+        "nfm": f"/api/captures/{capture_id}/audio/nfm",
+        "wfm": f"/api/captures/{capture_id}/audio/wfm",
+    }
     return data
+
+
+def read_iq_file(iq_path: Path) -> Any:
+    import numpy as np
+
+    raw = np.fromfile(iq_path, dtype=np.uint8)
+    if raw.size < 4096:
+        raise RuntimeError("Capture file was too small to analyze")
+    raw = raw[: raw.size - (raw.size % 2)]
+    iq = (raw[0::2].astype(np.float32) - 127.5) + 1j * (raw[1::2].astype(np.float32) - 127.5)
+    return iq / 128.0
+
+
+def resample_audio(samples: Any, source_rate_hz: int, target_rate_hz: int = 48_000) -> Any:
+    import numpy as np
+
+    if samples.size == 0:
+        return samples
+    duration = samples.size / source_rate_hz
+    target_count = max(1, int(duration * target_rate_hz))
+    source_x = np.linspace(0, duration, samples.size, endpoint=False)
+    target_x = np.linspace(0, duration, target_count, endpoint=False)
+    return np.interp(target_x, source_x, samples).astype(np.float32)
+
+
+def smooth_for_audio(samples: Any, source_rate_hz: int, bandwidth_hz: int) -> Any:
+    import numpy as np
+
+    window = max(1, int(source_rate_hz / max(1, bandwidth_hz * 2)))
+    if window <= 1:
+        return samples
+    kernel = np.ones(window, dtype=np.float32) / window
+    return np.convolve(samples, kernel, mode="same").astype(np.float32)
+
+
+def write_wav(path: Path, samples: Any, sample_rate_hz: int = 48_000) -> dict[str, Any]:
+    import numpy as np
+
+    samples = samples.astype(np.float32)
+    samples = samples - float(np.mean(samples))
+    peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+    if peak > 0:
+        samples = samples / peak
+    pcm = np.clip(samples * 0.85 * 32767, -32768, 32767).astype("<i2")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate_hz)
+        wav.writeframes(pcm.tobytes())
+    return {"sample_rate_hz": sample_rate_hz, "samples": int(pcm.size), "duration_seconds": round(pcm.size / sample_rate_hz, 3)}
+
+
+def generate_audio_preview(iq_path: Path, sample_rate_hz: int, mode: str, wav_path: Path) -> dict[str, Any]:
+    import numpy as np
+
+    iq = read_iq_file(iq_path)
+    if mode == "am":
+        audio = np.abs(iq)
+        audio = smooth_for_audio(audio, sample_rate_hz, 8_000)
+    elif mode in {"nfm", "wfm"}:
+        demod = np.angle(iq[1:] * np.conj(iq[:-1])).astype(np.float32)
+        bandwidth = 12_000 if mode == "nfm" else 16_000
+        audio = smooth_for_audio(demod, sample_rate_hz, bandwidth)
+    else:
+        raise HTTPException(400, "Unsupported audio mode")
+    resampled = resample_audio(audio, sample_rate_hz, 48_000)
+    info = write_wav(wav_path, resampled, 48_000)
+    info["mode"] = mode
+    return info
+
+
+def ensure_audio_preview(capture_id: str, mode: str) -> Path:
+    if mode not in {"am", "nfm", "wfm"}:
+        raise HTTPException(400, "Unsupported audio mode")
+    wav_path = capture_path(capture_id, f".{mode}.wav")
+    if wav_path.exists():
+        return wav_path
+    meta_path = capture_path(capture_id, ".json")
+    iq_path = capture_path(capture_id, ".iq")
+    if not meta_path.exists() or not iq_path.exists():
+        raise HTTPException(404, "Capture not found")
+    meta = json.loads(meta_path.read_text())
+    audio = meta.setdefault("audio", {})
+    audio[mode] = generate_audio_preview(iq_path, int(meta["sample_rate_hz"]), mode, wav_path)
+    meta_path.write_text(json.dumps(meta, indent=2))
+    return wav_path
 
 
 def draw_spectrum_frame(
@@ -211,12 +304,7 @@ def summarize_iq(
     import numpy as np
     from PIL import Image, ImageDraw
 
-    raw = np.fromfile(iq_path, dtype=np.uint8)
-    if raw.size < 4096:
-        raise RuntimeError("Capture file was too small to analyze")
-    raw = raw[: raw.size - (raw.size % 2)]
-    iq = (raw[0::2].astype(np.float32) - 127.5) + 1j * (raw[1::2].astype(np.float32) - 127.5)
-    iq /= 128.0
+    iq = read_iq_file(iq_path)
 
     usable = iq[: min(iq.size, sample_rate_hz * 5)]
     nfft = 2048
@@ -369,6 +457,10 @@ def capture_signal(
             raise RuntimeError("hackrf_transfer did not create a capture file")
         meta["iq_bytes"] = iq_path.stat().st_size
         meta["analysis"] = summarize_iq(iq_path, sample_rate_hz, frequency_hz, png_path, gif_path)
+        meta["audio"] = {
+            mode: generate_audio_preview(iq_path, sample_rate_hz, mode, capture_path(capture_id, f".{mode}.wav"))
+            for mode in ("am", "nfm", "wfm")
+        }
         meta["status"] = "complete"
         meta["completed_at"] = datetime.now(timezone.utc).isoformat()
         meta_path.write_text(json.dumps(meta, indent=2))
@@ -600,6 +692,12 @@ def capture_animation(capture_id: str) -> FileResponse:
     return FileResponse(path, media_type="image/gif")
 
 
+@app.get("/api/captures/{capture_id}/audio/{mode}")
+def capture_audio(capture_id: str, mode: str) -> FileResponse:
+    path = ensure_audio_preview(capture_id, mode)
+    return FileResponse(path, media_type="audio/wav", filename=path.name)
+
+
 @app.get("/api/captures/{capture_id}/iq")
 def capture_iq(capture_id: str) -> FileResponse:
     path = capture_path(capture_id, ".iq")
@@ -652,6 +750,9 @@ HTML = r"""<!doctype html>
     .captureImg { width:100%; border:1px solid var(--line); border-radius:8px; margin-top:8px; background:#0c1013; cursor:zoom-in; }
     .captureCaption { color:var(--muted); font-size:12px; line-height:1.35; margin-top:6px; }
     .captureToggle { display:flex; gap:6px; margin-top:8px; }
+    .audioPreview { margin-top:10px; display:flex; flex-direction:column; gap:8px; }
+    .audioRow { display:grid; grid-template-columns: 42px 1fr; align-items:center; gap:8px; color:var(--muted); font-size:12px; }
+    audio { width:100%; height:32px; }
     #zoomState { color: var(--hot); }
     #detailCanvas { height:220px; margin-top:10px; }
     @media (max-width: 1000px) { main { grid-template-columns: 1fr; } aside { border-left:0; border-top:1px solid var(--line); } #heatmapWrap { height: 60vh; } }
@@ -692,13 +793,13 @@ HTML = r"""<!doctype html>
     </div>
     <h3>Capture</h3>
     <div class="contextBox">
-      <div id="captureStatus" class="muted">Select a frequency to capture raw IQ and create a spectrogram.</div>
+    <div id="captureStatus" class="muted">Select a frequency to capture raw IQ and create a spectrogram.</div>
       <div class="captureActions">
         <label>Seconds <select id="captureSeconds"><option>2</option><option selected>4</option><option>8</option><option>12</option></select></label>
         <label>Rate <select id="captureRate"><option value="2000000">2 Msps</option><option value="5000000" selected>5 Msps</option><option value="10000000">10 Msps</option></select></label>
         <button id="captureBtn" class="primaryBtn" disabled>Capture Signal</button>
       </div>
-      <div class="hint">Capture briefly pauses the wideband sweep, records HackRF IQ around the selected frequency, then resumes sweeping.</div>
+      <div class="hint">Capture briefly pauses the wideband sweep, records HackRF IQ around the selected frequency, then resumes sweeping. Audio previews are demodulation guesses; many digital signals will sound like noise.</div>
     </div>
     <div id="captures" class="list"></div>
     <h3>Anomalies</h3>
@@ -968,6 +1069,7 @@ async function load() {
 
 function captureItemHtml(capture) {
   const analysis = capture.analysis || {};
+  const audio = capture.audio_urls || {};
   const status = capture.status === 'complete' ? 'Complete' : capture.status;
   const img = capture.status === 'complete' ? `
     <div class="captureToggle">
@@ -975,7 +1077,13 @@ function captureItemHtml(capture) {
       <button class="smallBtn" onclick="showCaptureArtifact('${capture.id}', '${capture.spectrogram_url}', 'spectrogram')">Spectrogram</button>
     </div>
     <img id="capture-img-${capture.id}" class="captureImg" onclick="openCaptureArtifact('${capture.id}')" data-current-url="${capture.animation_url}" src="${capture.animation_url}?t=${encodeURIComponent(capture.completed_at || capture.started_at)}" alt="Animated spectrum for ${capture.frequency_mhz.toFixed(3)} MHz capture">
-    <div id="capture-caption-${capture.id}" class="captureCaption">Animated spectrum: each frame is about 1 second. X axis is frequency, Y axis is relative strength. Download IQ is the raw radio sample file for later demodulation/classification.</div>` : '';
+    <div id="capture-caption-${capture.id}" class="captureCaption">Animated spectrum: each frame is about 1 second. X axis is frequency, Y axis is relative strength. Download IQ is the raw radio sample file for later demodulation/classification.</div>
+    <div class="audioPreview">
+      <div class="audioRow"><span>AM</span><audio controls preload="none" src="${audio.am || ''}"></audio></div>
+      <div class="audioRow"><span>NFM</span><audio controls preload="none" src="${audio.nfm || ''}"></audio></div>
+      <div class="audioRow"><span>WFM</span><audio controls preload="none" src="${audio.wfm || ''}"></audio></div>
+    </div>
+    <div class="captureCaption">Try AM, NFM, and WFM. If all three are static/noise, the signal is probably digital, too wide/narrow for this preset, offset from center, or not audio-bearing.</div>` : '';
   const peak = analysis.peak_frequency_mhz ? `<br>Peak ${analysis.peak_frequency_mhz.toFixed(6)} MHz` : '';
   return `<div class="item">
     <b>${capture.frequency_mhz.toFixed(3)} MHz</b><br>
