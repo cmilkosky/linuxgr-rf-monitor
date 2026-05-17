@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import math
 import os
 import subprocess
 import statistics
@@ -23,6 +24,7 @@ CONFIG_PATH = Path(os.environ.get("RF_MONITOR_ENV", "/home/cmilkosk/.config/hack
 STATUS_PATH = Path(os.environ.get("RF_MONITOR_STATUS", "/home/cmilkosk/rf-monitor/status.json"))
 CAPTURE_DIR = Path(os.environ.get("RF_CAPTURE_DIR", "/home/cmilkosk/rf-monitor/captures"))
 CAPTURE_LOCK = threading.Lock()
+DEEP_SCAN_LOCK = threading.Lock()
 
 
 def load_env(path: Path = CONFIG_PATH) -> dict[str, str]:
@@ -154,6 +156,87 @@ def pause_sweep_service() -> bool:
 def resume_sweep_service() -> None:
     run_command(["sudo", "systemctl", "start", "--no-block", "hackrf-influx.service"], timeout=10)
     wait_for_service_state("hackrf-influx.service", {"active"}, 30)
+
+
+def parse_hackrf_sweep_line(line: str) -> list[dict[str, float]]:
+    parts = [part.strip() for part in line.split(",")]
+    if len(parts) < 7:
+        return []
+    try:
+        low_hz = int(float(parts[2]))
+        high_hz = int(float(parts[3]))
+        bin_width_hz = int(float(parts[4]))
+        values = [float(value) for value in parts[6:] if value]
+    except ValueError:
+        return []
+    if not values or high_hz <= low_hz:
+        return []
+    actual_width_hz = (high_hz - low_hz) / len(values)
+    width_hz = bin_width_hz if bin_width_hz > 0 else actual_width_hz
+    points = []
+    for idx, value in enumerate(values):
+        freq_hz = low_hz + (idx + 0.5) * actual_width_hz
+        points.append(
+            {
+                "frequency_hz": round(freq_hz),
+                "frequency_mhz": round(freq_hz / 1_000_000, 6),
+                "rssi_db": value,
+                "bin_width_hz": width_hz,
+            }
+        )
+    return points
+
+
+def run_deep_scan(center_frequency_hz: int, span_mhz: int, bin_width_hz: int) -> dict[str, Any]:
+    if not DEEP_SCAN_LOCK.acquire(blocking=False):
+        raise HTTPException(409, "A deep scan is already running")
+    half_span_hz = span_mhz * 1_000_000 // 2
+    low_hz = max(1_000_000, center_frequency_hz - half_span_hz)
+    high_hz = min(6_000_000_000, center_frequency_hz + half_span_hz)
+    low_mhz = math.floor(low_hz / 1_000_000)
+    high_mhz = math.ceil(high_hz / 1_000_000)
+    command = ["hackrf_sweep", "-1", "-f", f"{low_mhz}:{high_mhz}", "-w", str(bin_width_hz)]
+    sweep_was_active = service_is_active("hackrf-influx.service")
+    started_at = datetime.now(timezone.utc)
+    try:
+        if sweep_was_active:
+            pause_sweep_service()
+            time.sleep(1.0)
+        result = run_command(command, timeout=35)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"hackrf_sweep exited with {result.returncode}")
+        points = []
+        for line in result.stdout.splitlines():
+            points.extend(parse_hackrf_sweep_line(line))
+        points = [point for point in points if low_hz <= point["frequency_hz"] <= high_hz]
+        points.sort(key=lambda item: item["frequency_hz"])
+        if not points:
+            raise RuntimeError("hackrf_sweep returned no usable bins")
+        peak = max(points, key=lambda item: item["rssi_db"])
+        return {
+            "started_at": started_at.isoformat(),
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "center_frequency_hz": center_frequency_hz,
+            "center_frequency_mhz": round(center_frequency_hz / 1_000_000, 6),
+            "span_mhz": span_mhz,
+            "bin_width_hz": bin_width_hz,
+            "bin_width_khz": round(bin_width_hz / 1000, 3),
+            "frequency_min_hz": low_hz,
+            "frequency_max_hz": high_hz,
+            "points": points,
+            "peak": peak,
+            "command": command,
+            "sweep_was_active": sweep_was_active,
+        }
+    except Exception as exc:
+        raise HTTPException(500, str(exc)) from exc
+    finally:
+        if sweep_was_active:
+            try:
+                resume_sweep_service()
+            except Exception:
+                pass
+        DEEP_SCAN_LOCK.release()
 
 
 def capture_path(capture_id: str, suffix: str) -> Path:
@@ -684,6 +767,20 @@ def capture(
     return JSONResponse(record)
 
 
+@app.post("/api/deep-scan")
+def deep_scan(payload: dict[str, Any] = Body(...)) -> JSONResponse:
+    frequency_hz = int(payload.get("frequency_hz", 0))
+    span_mhz = int(payload.get("span_mhz", 20))
+    bin_width_hz = int(payload.get("bin_width_hz", 100_000))
+    if frequency_hz < 1_000_000 or frequency_hz > 6_000_000_000:
+        raise HTTPException(400, "frequency_hz is outside the supported scan range")
+    if span_mhz < 2 or span_mhz > 100:
+        raise HTTPException(400, "span_mhz must be between 2 and 100")
+    if bin_width_hz < 25_000 or bin_width_hz > 1_000_000:
+        raise HTTPException(400, "bin_width_hz must be between 25 kHz and 1 MHz")
+    return JSONResponse(run_deep_scan(frequency_hz, span_mhz, bin_width_hz))
+
+
 @app.get("/api/captures/{capture_id}/meta")
 def capture_meta(capture_id: str) -> JSONResponse:
     path = capture_path(capture_id, ".json")
@@ -779,6 +876,9 @@ HTML = r"""<!doctype html>
     .captureImg { width:100%; border:1px solid var(--line); border-radius:8px; margin-top:8px; background:#0c1013; cursor:zoom-in; }
     .captureCaption { color:var(--muted); font-size:12px; line-height:1.35; margin-top:6px; }
     .captureToggle { display:flex; gap:6px; margin-top:8px; }
+    .deepScanBox { margin-top:12px; border:1px solid var(--line); background:var(--panel); border-radius:8px; padding:10px; }
+    .deepScanBox h4 { margin:0 0 6px; font-size:13px; }
+    #deepScanCanvas { height:190px; margin-top:10px; }
     .audioPreview { margin-top:10px; display:flex; flex-direction:column; gap:8px; }
     .audioRow { display:grid; grid-template-columns: 42px 1fr; align-items:center; gap:8px; color:var(--muted); font-size:12px; }
     audio { width:100%; height:32px; }
@@ -815,6 +915,17 @@ HTML = r"""<!doctype html>
     <div id="selected" class="muted">Click a heatmap block.</div>
     <canvas id="detailCanvas" class="panel"></canvas>
     <div class="hint">Detail graph: RSSI over the last 6 hours for the selected frequency and nearby bins. Each colored line is one neighboring bin; spikes mean that bin got stronger during that time.</div>
+    <div class="deepScanBox">
+      <h4>Focused Scan</h4>
+      <div id="deepScanStatus" class="muted">Zoom into a frequency, then double-click a heatmap block or run a focused scan here.</div>
+      <div class="captureActions">
+        <label>Span <select id="deepSpan"><option value="10">10 MHz</option><option value="20" selected>20 MHz</option><option value="50">50 MHz</option></select></label>
+        <label>Bin <select id="deepBin"><option value="25000">25 kHz</option><option value="50000">50 kHz</option><option value="100000" selected>100 kHz</option><option value="250000">250 kHz</option></select></label>
+        <button id="deepScanBtn" class="primaryBtn" disabled>Focused Scan</button>
+      </div>
+      <canvas id="deepScanCanvas" class="panel"></canvas>
+      <div class="hint">Focused scans briefly pause the wide sweep and take a high-resolution look around the selected frequency. They are snapshots, separate from the always-on 1 MHz baseline.</div>
+    </div>
     <div class="contextBox">
       <h4>Frequency Context</h4>
       <div id="bandContext" class="muted">Hover the colored rail or a heatmap block.</div>
@@ -840,6 +951,7 @@ HTML = r"""<!doctype html>
 <script>
 const heat = document.getElementById('heatmap');
 const detail = document.getElementById('detailCanvas');
+const deepCanvas = document.getElementById('deepScanCanvas');
 let heatData = null;
 let hoverCell = null;
 let hoverFreqHz = null;
@@ -847,6 +959,8 @@ let zoomMinHz = null;
 let zoomMaxHz = null;
 let selectedFreqHz = null;
 let captureRunning = false;
+let deepScanRunning = false;
+let deepScanData = null;
 
 const BAND_REFS = [
   {name:'VHF', min:30, max:300, info:'30-300 MHz. FM broadcast, airband, marine, weather radio, amateur 6m/2m, and other land-mobile activity can appear here.'},
@@ -1052,6 +1166,7 @@ function resetZoom() {
 async function selectFrequency(freq) {
   selectedFreqHz = freq;
   document.getElementById('captureBtn').disabled = captureRunning ? true : false;
+  document.getElementById('deepScanBtn').disabled = deepScanRunning ? true : false;
   document.getElementById('selected').innerHTML = `<b>${(freq/1e6).toFixed(3)} MHz</b><br><span class="muted">Loading detail...</span>`;
   updateBandContext(freq);
   const data = await fetch(`/api/frequency/${freq}?hours=6&span_mhz=2`).then(r=>r.json());
@@ -1077,6 +1192,89 @@ function drawDetail(data) {
     });
     ctx.stroke();
   });
+}
+
+function drawDeepScan() {
+  const {ctx, width, height} = resizeCanvas(deepCanvas);
+  ctx.clearRect(0,0,width,height);
+  if (!deepScanData || !deepScanData.points?.length) {
+    ctx.fillStyle = '#9caab5';
+    ctx.font = '12px system-ui';
+    ctx.fillText('Focused scan results will appear here.', 12, 24);
+    return;
+  }
+  const pts = deepScanData.points;
+  const minFreq = pts[0].frequency_mhz;
+  const maxFreq = pts[pts.length - 1].frequency_mhz;
+  const values = pts.map(p => p.rssi_db);
+  const minDb = Math.min(...values);
+  const maxDb = Math.max(...values);
+  const left = 42, right = 10, top = 12, bottom = 34;
+  const plotW = width - left - right;
+  const plotH = height - top - bottom;
+  ctx.strokeStyle = '#2b353d';
+  ctx.strokeRect(left, top, plotW, plotH);
+  ctx.strokeStyle = '#24313a';
+  for (let i=1; i<4; i++) {
+    const y = top + i * plotH / 4;
+    ctx.beginPath();
+    ctx.moveTo(left, y);
+    ctx.lineTo(left + plotW, y);
+    ctx.stroke();
+  }
+  ctx.strokeStyle = '#ffca62';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  pts.forEach((p, i) => {
+    const x = left + ((p.frequency_mhz - minFreq) / Math.max(0.0001, maxFreq - minFreq)) * plotW;
+    const y = top + (1 - ((p.rssi_db - minDb) / Math.max(1, maxDb - minDb))) * plotH;
+    if (i === 0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  });
+  ctx.stroke();
+  const peak = deepScanData.peak;
+  if (peak) {
+    const x = left + ((peak.frequency_mhz - minFreq) / Math.max(0.0001, maxFreq - minFreq)) * plotW;
+    ctx.strokeStyle = '#ff6f91';
+    ctx.beginPath();
+    ctx.moveTo(x, top);
+    ctx.lineTo(x, top + plotH);
+    ctx.stroke();
+  }
+  ctx.fillStyle = '#9caab5';
+  ctx.font = '12px system-ui';
+  ctx.fillText(`${minFreq.toFixed(3)} MHz`, left, height - 10);
+  ctx.fillText(`${maxFreq.toFixed(3)} MHz`, Math.max(left, width - 112), height - 10);
+  ctx.fillText(`${maxDb.toFixed(1)} dB`, 4, top + 10);
+  ctx.fillText(`${minDb.toFixed(1)} dB`, 4, top + plotH);
+}
+
+async function runFocusedScan(freq=selectedFreqHz) {
+  if (!freq || deepScanRunning) return;
+  deepScanRunning = true;
+  document.getElementById('deepScanBtn').disabled = true;
+  document.getElementById('deepScanStatus').innerHTML = `<b>${(freq/1e6).toFixed(3)} MHz</b><br>Running focused scan...`;
+  const span = Number(document.getElementById('deepSpan').value);
+  const bin = Number(document.getElementById('deepBin').value);
+  try {
+    const response = await fetch('/api/deep-scan', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({frequency_hz: freq, span_mhz: span, bin_width_hz: bin})
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || data.error || 'Focused scan failed');
+    deepScanData = data;
+    const peak = data.peak;
+    document.getElementById('deepScanStatus').innerHTML =
+      `<b>${data.center_frequency_mhz.toFixed(3)} MHz focused scan</b><br>` +
+      `<span class="muted">${data.points.length} bins · ${data.bin_width_khz.toFixed(0)} kHz · peak ${peak.frequency_mhz.toFixed(6)} MHz at ${peak.rssi_db.toFixed(1)} dB</span>`;
+    drawDeepScan();
+  } catch (err) {
+    document.getElementById('deepScanStatus').innerHTML = `<b>Focused scan failed</b><br><span class="muted">${err.message}</span>`;
+  } finally {
+    deepScanRunning = false;
+    document.getElementById('deepScanBtn').disabled = selectedFreqHz === null;
+  }
 }
 
 async function load(quick=false) {
@@ -1238,6 +1436,17 @@ heat.addEventListener('click', e => {
     load();
   }
 });
+heat.addEventListener('dblclick', e => {
+  const cell = heatCell(e);
+  const railFreq = railFrequency(e);
+  const freq = cell ? cell.freq : railFreq;
+  if (freq) {
+    zoomAround(freq);
+    selectFrequency(freq);
+    load();
+    runFocusedScan(freq);
+  }
+});
 heat.addEventListener('mousemove', e => {
   hoverCell = heatCell(e);
   const railFreq = railFrequency(e);
@@ -1262,13 +1471,15 @@ heat.addEventListener('mouseleave', () => {
   document.getElementById('hoverReadout').textContent = '';
   drawHeatmap();
 });
-window.addEventListener('resize', () => { drawHeatmap(); if (heatData) drawHeatmap(); });
+window.addEventListener('resize', () => { drawHeatmap(); drawDeepScan(); });
 document.getElementById('refresh').addEventListener('click', load);
 document.getElementById('resetZoom').addEventListener('click', resetZoom);
 document.getElementById('captureBtn').addEventListener('click', captureSelected);
+document.getElementById('deepScanBtn').addEventListener('click', () => runFocusedScan());
 document.getElementById('hours').addEventListener('change', load);
 document.getElementById('freqStep').addEventListener('change', () => { resetZoom(); });
 initialLoad();
+drawDeepScan();
 loadCaptures();
 setInterval(load, 60000);
 setInterval(loadCaptures, 60000);
