@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 CONFIG_PATH = Path(os.environ.get("RF_MONITOR_ENV", "/home/cmilkosk/.config/hackrf-influx.env"))
 STATUS_PATH = Path(os.environ.get("RF_MONITOR_STATUS", "/home/cmilkosk/rf-monitor/status.json"))
 CAPTURE_DIR = Path(os.environ.get("RF_CAPTURE_DIR", "/home/cmilkosk/rf-monitor/captures"))
+DEEP_SCAN_DIR = Path(os.environ.get("RF_DEEP_SCAN_DIR", "/home/cmilkosk/rf-monitor/deep-scans"))
 CAPTURE_LOCK = threading.Lock()
 DEEP_SCAN_LOCK = threading.Lock()
 
@@ -158,19 +159,19 @@ def resume_sweep_service() -> None:
     wait_for_service_state("hackrf-influx.service", {"active"}, 30)
 
 
-def parse_hackrf_sweep_line(line: str) -> list[dict[str, float]]:
+def parse_hackrf_sweep_row(line: str) -> dict[str, Any] | None:
     parts = [part.strip() for part in line.split(",")]
     if len(parts) < 7:
-        return []
+        return None
     try:
         low_hz = int(float(parts[2]))
         high_hz = int(float(parts[3]))
         bin_width_hz = int(float(parts[4]))
         values = [float(value) for value in parts[6:] if value]
     except ValueError:
-        return []
+        return None
     if not values or high_hz <= low_hz:
-        return []
+        return None
     actual_width_hz = (high_hz - low_hz) / len(values)
     width_hz = bin_width_hz if bin_width_hz > 0 else actual_width_hz
     points = []
@@ -184,7 +185,131 @@ def parse_hackrf_sweep_line(line: str) -> list[dict[str, float]]:
                 "bin_width_hz": width_hz,
             }
         )
-    return points
+    return {"low_hz": low_hz, "high_hz": high_hz, "points": points}
+
+
+def parse_hackrf_sweep_line(line: str) -> list[dict[str, float]]:
+    row = parse_hackrf_sweep_row(line)
+    return row["points"] if row else []
+
+
+def parse_hackrf_sweep_frames(output: str, low_hz: int, high_hz: int) -> list[list[dict[str, float]]]:
+    frames: list[list[dict[str, float]]] = []
+    current: list[dict[str, float]] = []
+    last_low_hz: int | None = None
+    for line in output.splitlines():
+        row = parse_hackrf_sweep_row(line)
+        if not row:
+            continue
+        if current and last_low_hz is not None and row["low_hz"] <= last_low_hz:
+            frames.append(sorted(current, key=lambda item: item["frequency_hz"]))
+            current = []
+        current.extend(point for point in row["points"] if low_hz <= point["frequency_hz"] <= high_hz)
+        last_low_hz = row["low_hz"]
+    if current:
+        frames.append(sorted(current, key=lambda item: item["frequency_hz"]))
+    return [frame for frame in frames if frame]
+
+
+def deep_scan_path(scan_id: str, suffix: str) -> Path:
+    safe_id = "".join(ch for ch in scan_id if ch.isalnum() or ch in "-_")
+    if safe_id != scan_id:
+        raise HTTPException(400, "Invalid focused scan id")
+    return DEEP_SCAN_DIR / f"{safe_id}{suffix}"
+
+
+def find_peak_points(points: list[dict[str, float]], limit: int = 5) -> list[dict[str, float]]:
+    if not points:
+        return []
+    sorted_points = sorted(points, key=lambda item: item["rssi_db"], reverse=True)
+    min_spacing_hz = max(100_000, int(max(point.get("bin_width_hz", 0) for point in points) * 4))
+    peaks = []
+    for point in sorted_points:
+        if all(abs(point["frequency_hz"] - peak["frequency_hz"]) >= min_spacing_hz for peak in peaks):
+            peaks.append(point)
+        if len(peaks) >= limit:
+            break
+    return peaks
+
+
+def draw_focused_scan_frame(
+    Image: Any,
+    ImageDraw: Any,
+    points: list[dict[str, float]],
+    center_frequency_hz: int,
+    span_mhz: int,
+    frame_number: int,
+    total_frames: int,
+    low_db: float,
+    high_db: float,
+) -> Any:
+    width, height = 900, 520
+    left, top, right, bottom = 82, 42, 24, 72
+    plot_w = width - left - right
+    plot_h = height - top - bottom
+    img = Image.new("RGB", (width, height), (16, 20, 24))
+    draw = ImageDraw.Draw(img)
+    draw.text((22, 16), f"{center_frequency_hz / 1_000_000:.3f} MHz focused scan", fill=(231, 237, 242))
+    draw.text((width - 180, 16), f"{frame_number}/{total_frames}", fill=(99, 210, 255))
+    draw.rectangle((left, top, left + plot_w, top + plot_h), outline=(43, 53, 61))
+    min_mhz = points[0]["frequency_mhz"]
+    max_mhz = points[-1]["frequency_mhz"]
+    for i in range(5):
+        x = left + round(i * plot_w / 4)
+        y = top + round(i * plot_h / 4)
+        draw.line((x, top, x, top + plot_h), fill=(30, 38, 44))
+        draw.line((left, y, left + plot_w, y), fill=(30, 38, 44))
+        mhz = min_mhz + i * (max_mhz - min_mhz) / 4
+        db = high_db - i * (high_db - low_db) / 4
+        draw.text((x - 28, top + plot_h + 14), f"{mhz:.3f}", fill=(156, 170, 181))
+        draw.text((16, y - 7), f"{db:.0f}", fill=(156, 170, 181))
+    draw.text((left + plot_w // 2 - 54, height - 28), "Frequency (MHz)", fill=(156, 170, 181))
+    draw.text((16, top + plot_h // 2 + 22), "dB", fill=(156, 170, 181))
+    span = max(0.001, max_mhz - min_mhz)
+    db_span = max(1.0, high_db - low_db)
+    line = []
+    for point in points:
+        x = left + ((point["frequency_mhz"] - min_mhz) / span) * plot_w
+        y = top + (1 - max(0, min(1, (point["rssi_db"] - low_db) / db_span))) * plot_h
+        line.append((float(x), float(y)))
+    if len(line) > 1:
+        draw.line(line, fill=(255, 202, 98), width=2)
+    peaks = find_peak_points(points, 4)
+    for idx, peak in enumerate(peaks):
+        x = left + ((peak["frequency_mhz"] - min_mhz) / span) * plot_w
+        y = top + (1 - max(0, min(1, (peak["rssi_db"] - low_db) / db_span))) * plot_h
+        draw.line((x, top, x, top + plot_h), fill=(255, 111, 145), width=1)
+        label = f"{peak['frequency_mhz']:.6f}"
+        label_x = max(left, min(width - 118, int(x) - 36))
+        label_y = max(top + 4, int(y) - 18 - (idx % 2) * 16)
+        draw.rectangle((label_x - 4, label_y - 2, label_x + 106, label_y + 13), fill=(16, 20, 24), outline=(255, 111, 145))
+        draw.text((label_x, label_y), label, fill=(231, 237, 242))
+    draw.text((left, height - 52), f"Span {span_mhz} MHz   Peaks labelled by MHz", fill=(156, 170, 181))
+    return img
+
+
+def write_focused_scan_gif(
+    scan_id: str,
+    frames: list[list[dict[str, float]]],
+    center_frequency_hz: int,
+    span_mhz: int,
+) -> Path:
+    from PIL import Image, ImageDraw
+
+    all_values = [point["rssi_db"] for frame in frames for point in frame]
+    low_db = min(all_values)
+    high_db = max(all_values)
+    span = max(1.0, high_db - low_db)
+    low_db -= span * 0.25
+    high_db += span * 0.35
+    images = [
+        draw_focused_scan_frame(Image, ImageDraw, frame, center_frequency_hz, span_mhz, idx + 1, len(frames), low_db, high_db)
+        for idx, frame in enumerate(frames)
+    ]
+    path = deep_scan_path(scan_id, ".gif")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    images[0].save(path, save_all=True, append_images=images[1:], duration=850, loop=0)
+    return path
 
 
 def run_deep_scan(center_frequency_hz: int, span_mhz: int, bin_width_hz: int) -> dict[str, Any]:
@@ -195,25 +320,33 @@ def run_deep_scan(center_frequency_hz: int, span_mhz: int, bin_width_hz: int) ->
     high_hz = min(6_000_000_000, center_frequency_hz + half_span_hz)
     low_mhz = math.floor(low_hz / 1_000_000)
     high_mhz = math.ceil(high_hz / 1_000_000)
-    command = ["hackrf_sweep", "-1", "-f", f"{low_mhz}:{high_mhz}", "-w", str(bin_width_hz)]
+    scan_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"-{center_frequency_hz}"
+    command = ["hackrf_sweep", "-N", "4", "-f", f"{low_mhz}:{high_mhz}", "-w", str(bin_width_hz)]
     sweep_was_active = service_is_active("hackrf-influx.service")
     started_at = datetime.now(timezone.utc)
     try:
         if sweep_was_active:
             pause_sweep_service()
             time.sleep(1.0)
-        result = run_command(command, timeout=35)
+        result = run_command(command, timeout=90)
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"hackrf_sweep exited with {result.returncode}")
-        points = []
-        for line in result.stdout.splitlines():
-            points.extend(parse_hackrf_sweep_line(line))
+        frames = parse_hackrf_sweep_frames(result.stdout, low_hz, high_hz)
+        points_by_freq: dict[int, dict[str, float]] = {}
+        for frame in frames:
+            for point in frame:
+                freq = int(point["frequency_hz"])
+                if freq not in points_by_freq or point["rssi_db"] > points_by_freq[freq]["rssi_db"]:
+                    points_by_freq[freq] = point
+        points = sorted(points_by_freq.values(), key=lambda item: item["frequency_hz"])
         points = [point for point in points if low_hz <= point["frequency_hz"] <= high_hz]
-        points.sort(key=lambda item: item["frequency_hz"])
-        if not points:
+        if not points or not frames:
             raise RuntimeError("hackrf_sweep returned no usable bins")
         peak = max(points, key=lambda item: item["rssi_db"])
+        peaks = find_peak_points(points, 5)
+        write_focused_scan_gif(scan_id, frames, center_frequency_hz, span_mhz)
         return {
+            "id": scan_id,
             "started_at": started_at.isoformat(),
             "completed_at": datetime.now(timezone.utc).isoformat(),
             "center_frequency_hz": center_frequency_hz,
@@ -225,6 +358,9 @@ def run_deep_scan(center_frequency_hz: int, span_mhz: int, bin_width_hz: int) ->
             "frequency_max_hz": high_hz,
             "points": points,
             "peak": peak,
+            "peaks": peaks,
+            "frame_count": len(frames),
+            "animation_url": f"/api/deep-scans/{scan_id}/animation",
             "command": command,
             "sweep_was_active": sweep_was_active,
         }
@@ -781,6 +917,14 @@ def deep_scan(payload: dict[str, Any] = Body(...)) -> JSONResponse:
     return JSONResponse(run_deep_scan(frequency_hz, span_mhz, bin_width_hz))
 
 
+@app.get("/api/deep-scans/{scan_id}/animation")
+def deep_scan_animation(scan_id: str) -> FileResponse:
+    path = deep_scan_path(scan_id, ".gif")
+    if not path.exists():
+        raise HTTPException(404, "Focused scan animation not found")
+    return FileResponse(path, media_type="image/gif")
+
+
 @app.get("/api/captures/{capture_id}/meta")
 def capture_meta(capture_id: str) -> JSONResponse:
     path = capture_path(capture_id, ".json")
@@ -879,6 +1023,8 @@ HTML = r"""<!doctype html>
     .deepScanBox { margin-top:12px; border:1px solid var(--line); background:var(--panel); border-radius:8px; padding:10px; }
     .deepScanBox h4 { margin:0 0 6px; font-size:13px; }
     #deepScanCanvas { height:190px; margin-top:10px; }
+    .deepScanImg { width:100%; border:1px solid var(--line); border-radius:8px; margin-top:10px; background:#0c1013; cursor:zoom-in; }
+    .peakList { color:var(--muted); font-size:12px; line-height:1.45; margin-top:8px; }
     .audioPreview { margin-top:10px; display:flex; flex-direction:column; gap:8px; }
     .audioRow { display:grid; grid-template-columns: 42px 1fr; align-items:center; gap:8px; color:var(--muted); font-size:12px; }
     audio { width:100%; height:32px; }
@@ -924,7 +1070,8 @@ HTML = r"""<!doctype html>
         <button id="deepScanBtn" class="primaryBtn" disabled>Focused Scan</button>
       </div>
       <canvas id="deepScanCanvas" class="panel"></canvas>
-      <div class="hint">Focused scans briefly pause the wide sweep and take a high-resolution look around the selected frequency. They are snapshots, separate from the always-on 1 MHz baseline.</div>
+      <div id="deepScanMedia"></div>
+      <div class="hint">Focused scans briefly pause the wide sweep and take a high-resolution look around the selected frequency. They are animated snapshots, separate from the always-on 1 MHz baseline.</div>
     </div>
     <div class="contextBox">
       <h4>Frequency Context</h4>
@@ -1248,11 +1395,20 @@ function drawDeepScan() {
   ctx.fillText(`${minDb.toFixed(1)} dB`, 4, top + plotH);
 }
 
+function focusedPeakHtml(data) {
+  const peaks = data.peaks || (data.peak ? [data.peak] : []);
+  if (!peaks.length) return '';
+  return `<div class="peakList"><b>Labelled peaks</b><br>` +
+    peaks.map((p, idx) => `${idx + 1}. ${p.frequency_mhz.toFixed(6)} MHz · ${p.rssi_db.toFixed(1)} dB`).join('<br>') +
+    `</div>`;
+}
+
 async function runFocusedScan(freq=selectedFreqHz) {
   if (!freq || deepScanRunning) return;
   deepScanRunning = true;
   document.getElementById('deepScanBtn').disabled = true;
   document.getElementById('deepScanStatus').innerHTML = `<b>${(freq/1e6).toFixed(3)} MHz</b><br>Running focused scan...`;
+  document.getElementById('deepScanMedia').innerHTML = '';
   const span = Number(document.getElementById('deepSpan').value);
   const bin = Number(document.getElementById('deepBin').value);
   try {
@@ -1267,7 +1423,11 @@ async function runFocusedScan(freq=selectedFreqHz) {
     const peak = data.peak;
     document.getElementById('deepScanStatus').innerHTML =
       `<b>${data.center_frequency_mhz.toFixed(3)} MHz focused scan</b><br>` +
-      `<span class="muted">${data.points.length} bins · ${data.bin_width_khz.toFixed(0)} kHz · peak ${peak.frequency_mhz.toFixed(6)} MHz at ${peak.rssi_db.toFixed(1)} dB</span>`;
+      `<span class="muted">${data.points.length} bins · ${data.bin_width_khz.toFixed(0)} kHz · ${data.frame_count || 1} frames · peak ${peak.frequency_mhz.toFixed(6)} MHz at ${peak.rssi_db.toFixed(1)} dB</span>`;
+    document.getElementById('deepScanMedia').innerHTML =
+      `<img class="deepScanImg" ondblclick="window.open('${data.animation_url}', '_blank')" src="${data.animation_url}?t=${encodeURIComponent(data.completed_at)}" alt="Animated focused scan around ${data.center_frequency_mhz.toFixed(3)} MHz">` +
+      `<div class="captureActions"><button class="smallBtn" onclick="window.open('${data.animation_url}', '_blank')">View Larger</button></div>` +
+      focusedPeakHtml(data);
     drawDeepScan();
   } catch (err) {
     document.getElementById('deepScanStatus').innerHTML = `<b>Focused scan failed</b><br><span class="muted">${err.message}</span>`;
