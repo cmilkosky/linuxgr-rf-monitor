@@ -998,7 +998,7 @@ def capture_animation(capture_id: str) -> FileResponse:
 @app.get("/api/captures/{capture_id}/audio/{mode}")
 def capture_audio(capture_id: str, mode: str) -> FileResponse:
     path = ensure_audio_preview(capture_id, mode)
-    return FileResponse(path, media_type="audio/wav", filename=path.name)
+    return FileResponse(path, media_type="audio/wav")
 
 
 @app.get("/api/captures/{capture_id}/iq")
@@ -1059,7 +1059,8 @@ HTML = r"""<!doctype html>
     .deepScanImg { width:100%; border:1px solid var(--line); border-radius:8px; margin-top:10px; background:#0c1013; cursor:zoom-in; }
     .peakList { color:var(--muted); font-size:12px; line-height:1.45; margin-top:8px; }
     .audioPreview { margin-top:10px; display:flex; flex-direction:column; gap:8px; }
-    .audioRow { display:grid; grid-template-columns: 42px 1fr; align-items:center; gap:8px; color:var(--muted); font-size:12px; }
+    .audioRow { display:grid; grid-template-columns: 42px 1fr 44px; align-items:center; gap:8px; color:var(--muted); font-size:12px; }
+    .audioLink { color:var(--accent); text-decoration:none; font-size:12px; }
     audio { width:100%; height:32px; }
     #zoomState { color: var(--hot); }
     #detailCanvas { height:220px; margin-top:10px; }
@@ -1591,6 +1592,8 @@ async function loadStatusPanels() {
 function captureItemHtml(capture) {
   const analysis = capture.analysis || {};
   const audio = capture.audio_urls || {};
+  const audioStamp = encodeURIComponent(capture.completed_at || capture.started_at || Date.now());
+  const audioSrc = mode => audio[mode] ? `${audio[mode]}?t=${audioStamp}` : '';
   const status = capture.status === 'complete' ? 'Complete' : capture.status;
   const img = capture.status === 'complete' ? `
     <div class="captureToggle">
@@ -1600,9 +1603,9 @@ function captureItemHtml(capture) {
     <img id="capture-img-${capture.id}" class="captureImg" onclick="openCaptureArtifact('${capture.id}')" data-current-url="${capture.animation_url}" src="${capture.animation_url}?t=${encodeURIComponent(capture.completed_at || capture.started_at)}" alt="Animated spectrum for ${capture.frequency_mhz.toFixed(3)} MHz capture">
     <div id="capture-caption-${capture.id}" class="captureCaption">Animated spectrum: each frame is about 1 second. X axis is frequency, Y axis is relative strength. Download IQ is the raw radio sample file for later demodulation/classification.</div>
     <div class="audioPreview">
-      <div class="audioRow"><span>AM</span><audio controls preload="none" src="${audio.am || ''}"></audio></div>
-      <div class="audioRow"><span>NFM</span><audio controls preload="none" src="${audio.nfm || ''}"></audio></div>
-      <div class="audioRow"><span>WFM</span><audio controls preload="none" src="${audio.wfm || ''}"></audio></div>
+      <div class="audioRow"><span>AM</span><audio controls preload="metadata"><source src="${audioSrc('am')}" type="audio/wav"></audio><a class="audioLink" href="${audioSrc('am')}" target="_blank">Open</a></div>
+      <div class="audioRow"><span>NFM</span><audio controls preload="metadata"><source src="${audioSrc('nfm')}" type="audio/wav"></audio><a class="audioLink" href="${audioSrc('nfm')}" target="_blank">Open</a></div>
+      <div class="audioRow"><span>WFM</span><audio controls preload="metadata"><source src="${audioSrc('wfm')}" type="audio/wav"></audio><a class="audioLink" href="${audioSrc('wfm')}" target="_blank">Open</a></div>
     </div>
     <div class="captureCaption">Try AM, NFM, and WFM. If all three are static/noise, the signal is probably digital, too wide/narrow for this preset, offset from center, or not audio-bearing.</div>` : '';
   const peak = analysis.peak_frequency_mhz ? `<br>Peak ${analysis.peak_frequency_mhz.toFixed(6)} MHz` : '';
