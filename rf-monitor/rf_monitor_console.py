@@ -20,7 +20,7 @@ from typing import Any
 import requests
 from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from rf_signal_intel import classify_signal
+from rf_signal_intel import classify_signal, extract_iq_features
 
 
 CONFIG_PATH = Path(os.environ.get("RF_MONITOR_ENV", "/home/cmilkosk/.config/hackrf-influx.env"))
@@ -502,6 +502,7 @@ def capture_record(meta_path: Path) -> dict[str, Any]:
     data = json.loads(meta_path.read_text())
     capture_id = data["id"]
     data["meta_url"] = f"/api/captures/{capture_id}/meta"
+    data["sigmf_url"] = f"/api/captures/{capture_id}/sigmf"
     data["iq_url"] = f"/api/captures/{capture_id}/iq"
     data["spectrogram_url"] = f"/api/captures/{capture_id}/spectrogram"
     data["animation_url"] = f"/api/captures/{capture_id}/animation"
@@ -600,6 +601,22 @@ def ensure_audio_preview(capture_id: str, mode: str) -> Path:
     audio[mode] = generate_audio_preview(iq_path, int(meta["sample_rate_hz"]), mode, wav_path)
     meta_path.write_text(json.dumps(meta, indent=2))
     return wav_path
+
+
+def find_recent_capture_for_frequency(frequency_hz: int) -> dict[str, Any] | None:
+    CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+    for path in sorted(CAPTURE_DIR.glob("*.json"), reverse=True)[:30]:
+        try:
+            record = capture_record(path)
+        except Exception:
+            continue
+        if record.get("status") != "complete":
+            continue
+        sample_rate_hz = int(record.get("sample_rate_hz") or 0)
+        center_hz = int(record.get("frequency_hz") or 0)
+        if sample_rate_hz and abs(center_hz - frequency_hz) <= sample_rate_hz // 2:
+            return record
+    return None
 
 
 def draw_spectrum_frame(
@@ -742,16 +759,68 @@ def summarize_iq(
     gif_path.parent.mkdir(parents=True, exist_ok=True)
     frames[0].save(gif_path, save_all=True, append_images=frames[1:], duration=850, loop=0)
 
-    mean_power = float(20 * np.log10(np.sqrt(np.mean(np.abs(usable) ** 2)) + 1e-12))
+    features = extract_iq_features(iq, sample_rate_hz, center_frequency_hz)
     return {
         "samples": int(iq.size),
         "duration_seconds": round(iq.size / sample_rate_hz, 3),
-        "mean_power_dbfs": round(mean_power, 2),
+        "mean_power_dbfs": features["mean_power_dbfs"],
         "peak_frequency_hz": int(center_frequency_hz + freqs[peak_index[0]]),
         "peak_frequency_mhz": round((center_frequency_hz + freqs[peak_index[0]]) / 1_000_000, 6),
         "animation_frame_seconds": 1,
         "animation_frames": len(frames),
+        "features": features,
     }
+
+
+def write_sigmf_metadata(
+    sigmf_path: Path,
+    capture_id: str,
+    center_frequency_hz: int,
+    sample_rate_hz: int,
+    sample_count: int,
+    started_at: str,
+    meta: dict[str, Any],
+) -> None:
+    analysis = meta.get("analysis") or {}
+    features = analysis.get("features") or {}
+    annotations = []
+    if features:
+        annotations.append(
+            {
+                "core:sample_start": 0,
+                "core:sample_count": sample_count,
+                "core:freq_lower_edge": features.get("occupied_low_hz"),
+                "core:freq_upper_edge": features.get("occupied_high_hz"),
+                "core:label": (meta.get("signal_intel") or {}).get("likely", "unclassified RF capture"),
+                "rfmonitor:traits": features.get("traits", []),
+                "rfmonitor:occupied_bandwidth_hz": features.get("occupied_bandwidth_hz"),
+                "rfmonitor:peak_frequency_hz": features.get("peak_frequency_hz"),
+                "rfmonitor:candidates": (meta.get("signal_intel") or {}).get("candidates", []),
+            }
+        )
+    doc = {
+        "global": {
+            "core:datatype": "cu8",
+            "core:sample_rate": sample_rate_hz,
+            "core:version": "1.2.6",
+            "core:description": "RF Monitor HackRF IQ capture",
+            "core:author": "linuxGR RF Monitor",
+            "core:recorder": "hackrf_transfer",
+            "rfmonitor:capture_id": capture_id,
+            "rfmonitor:lna_gain_db": meta.get("lna_gain_db"),
+            "rfmonitor:vga_gain_db": meta.get("vga_gain_db"),
+            "rfmonitor:amp_enable": meta.get("amp_enable"),
+        },
+        "captures": [
+            {
+                "core:sample_start": 0,
+                "core:frequency": center_frequency_hz,
+                "core:datetime": started_at,
+            }
+        ],
+        "annotations": annotations,
+    }
+    sigmf_path.write_text(json.dumps(doc, indent=2))
 
 
 def capture_signal(
@@ -769,6 +838,7 @@ def capture_signal(
     png_path = capture_path(capture_id, ".png")
     gif_path = capture_path(capture_id, ".gif")
     meta_path = capture_path(capture_id, ".json")
+    sigmf_path = capture_path(capture_id, ".sigmf-meta")
     sample_count = int(duration_seconds * sample_rate_hz)
     command = [
         "hackrf_transfer",
@@ -816,10 +886,13 @@ def capture_signal(
             raise RuntimeError("hackrf_transfer did not create a capture file")
         meta["iq_bytes"] = iq_path.stat().st_size
         meta["analysis"] = summarize_iq(iq_path, sample_rate_hz, frequency_hz, png_path, gif_path)
+        meta["signal_intel"] = classify_signal(frequency_hz, {"features": meta["analysis"].get("features", {})})
         meta["audio"] = {
             mode: generate_audio_preview(iq_path, sample_rate_hz, mode, capture_path(capture_id, f".{mode}.wav"))
             for mode in ("am", "nfm", "wfm")
         }
+        write_sigmf_metadata(sigmf_path, capture_id, frequency_hz, sample_rate_hz, sample_count, started_at.isoformat(), meta)
+        meta["sigmf_meta_path"] = str(sigmf_path)
         meta["status"] = "complete"
         meta["completed_at"] = datetime.now(timezone.utc).isoformat()
         meta_path.write_text(json.dumps(meta, indent=2))
@@ -991,8 +1064,15 @@ def identify_signal(payload: dict[str, Any] = Body(...)) -> JSONResponse:
         if int(item.get("frequency_hz", -1)) == frequency_hz:
             anomaly = item
             break
-    report = classify_signal(frequency_hz, {"anomaly": anomaly} if anomaly else {})
+    capture = find_recent_capture_for_frequency(frequency_hz)
+    features = ((capture or {}).get("analysis") or {}).get("features") or {}
+    report = classify_signal(frequency_hz, {"anomaly": anomaly, "features": features})
     report["source"] = "manual"
+    if capture:
+        report["capture_id"] = capture["id"]
+        report["capture_started_at"] = capture.get("started_at")
+        report["capture_meta_url"] = capture.get("meta_url")
+        report["capture_sigmf_url"] = capture.get("sigmf_url")
     report["generated_at"] = datetime.now(timezone.utc).isoformat()
     return JSONResponse(report)
 
@@ -1075,6 +1155,14 @@ def capture_meta(capture_id: str) -> JSONResponse:
     if not path.exists():
         raise HTTPException(404, "Capture not found")
     return JSONResponse(capture_record(path))
+
+
+@app.get("/api/captures/{capture_id}/sigmf")
+def capture_sigmf(capture_id: str) -> FileResponse:
+    path = capture_path(capture_id, ".sigmf-meta")
+    if not path.exists():
+        raise HTTPException(404, "SigMF metadata not found")
+    return FileResponse(path, media_type="application/json")
 
 
 @app.get("/api/captures/{capture_id}/spectrogram")
@@ -1574,13 +1662,25 @@ function signalIntelHtml(report) {
   const bands = (report.bands || []).map(b => `<span class="tag">${b.name}</span>`).join('');
   const reasons = (report.reasons || []).map(reason => `<li>${reason}</li>`).join('');
   const actions = (report.next_actions || []).map(action => `<li>${action}</li>`).join('');
+  const candidates = (report.candidates || []).map(c =>
+    `<li><b>${c.name}</b> · ${c.score}/100<br><span class="muted">${c.why}</span></li>`
+  ).join('');
+  const features = report.features || {};
+  const featureBits = [];
+  if (features.occupied_bandwidth_hz !== undefined) featureBits.push(`BW ${(features.occupied_bandwidth_hz/1000).toFixed(1)} kHz`);
+  if (features.peak_count !== undefined) featureBits.push(`${features.peak_count} peaks`);
+  if (features.burstiness !== undefined) featureBits.push(`burst ${features.burstiness}`);
+  if (features.traits?.length) featureBits.push(features.traits.join(', '));
   return `<b>${report.frequency_mhz.toFixed(3)} MHz</b><br>` +
     `<span class="muted">${report.likely} · ${report.confidence} confidence</span>` +
     `<div class="meter"><span style="width:${Math.max(0, Math.min(100, report.interestingness || 0))}%"></span></div>` +
     `<span class="muted">Interestingness ${report.interestingness || 0}/100</span>` +
     (bands ? `<div class="tagList">${bands}</div>` : '') +
+    (featureBits.length ? `<div class="hint"><b>Measured</b><br>${featureBits.join(' · ')}</div>` : '') +
+    (candidates ? `<div class="hint"><b>Candidates</b><ul>${candidates}</ul></div>` : '') +
     (reasons ? `<div class="hint"><b>Why</b><ul>${reasons}</ul></div>` : '') +
     (actions ? `<div class="hint"><b>Next</b><ul>${actions}</ul></div>` : '') +
+    (report.capture_id ? `<div class="hint">Used recent capture <a class="audioLink" href="${report.capture_meta_url}" target="_blank">${report.capture_id}</a>${report.capture_sigmf_url ? ` · <a class="audioLink" href="${report.capture_sigmf_url}" target="_blank">SigMF</a>` : ''}</div>` : '') +
     `<div class="hint">${report.note || ''}</div>`;
 }
 
@@ -1812,6 +1912,15 @@ async function loadStatusPanels() {
 
 function captureItemHtml(capture) {
   const analysis = capture.analysis || {};
+  const intel = capture.signal_intel || {};
+  const features = analysis.features || {};
+  const candidates = (intel.candidates || []).slice(0, 3).map(c => `${c.name} ${c.score}/100`).join('<br>');
+  const featureSummary = features.occupied_bandwidth_hz !== undefined
+    ? `<div class="captureCaption">Measured: ${(features.occupied_bandwidth_hz/1000).toFixed(1)} kHz occupied BW · ${features.peak_count || 0} peaks · ${(features.traits || []).join(', ') || 'no clear traits'}</div>`
+    : '';
+  const intelSummary = intel.likely
+    ? `<div class="captureCaption"><b>Signal ID:</b> ${intel.likely} · ${intel.confidence} confidence${candidates ? `<br>${candidates}` : ''}</div>`
+    : '';
   const audio = capture.audio_urls || {};
   const audioStamp = encodeURIComponent(capture.completed_at || capture.started_at || Date.now());
   const audioSrc = mode => audio[mode] ? `${audio[mode]}?t=${audioStamp}` : '';
@@ -1840,8 +1949,11 @@ function captureItemHtml(capture) {
       <button class="smallBtn" onclick="window.open('${capture.animation_viewer_url}', '_blank')">View Animation</button>
       <button class="smallBtn" onclick="window.open('${capture.spectrogram_url}', '_blank')">View Spectrogram</button>
       <button class="smallBtn" onclick="window.open('${capture.meta_url}', '_blank')">Details</button>
+      <button class="smallBtn" onclick="window.open('${capture.sigmf_url}', '_blank')">SigMF</button>
       <button class="smallBtn" onclick="window.open('${capture.iq_url}', '_blank')">Download IQ</button>
     </div>
+    ${featureSummary}
+    ${intelSummary}
     ${img}
   </div>`;
 }
