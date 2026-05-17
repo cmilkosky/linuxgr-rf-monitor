@@ -259,16 +259,22 @@ def summarize_iq(
 
     duration = usable.size / sample_rate_hz
     total_seconds = max(1, int(np.ceil(duration)))
-    frame_low = float(np.percentile(power_db, 10))
-    frame_high = float(np.percentile(power_db, 99.7))
     frame_times = starts / sample_rate_hz
-    frames = []
+    frame_spectra = []
     for second in range(total_seconds):
         cols = np.where((frame_times >= second) & (frame_times < second + 1))[0]
         if cols.size == 0:
             nearest = int(np.argmin(np.abs(frame_times - min(second, duration))))
             cols = np.array([nearest])
-        spectrum = np.max(power_db[:, cols], axis=1)
+        frame_spectra.append(np.max(power_db[:, cols], axis=1))
+    frame_values = np.concatenate(frame_spectra)
+    frame_low = float(np.percentile(frame_values, 5))
+    frame_high = float(np.percentile(frame_values, 99.5))
+    frame_span = max(1.0, frame_high - frame_low)
+    frame_low -= frame_span * 0.18
+    frame_high += frame_span * 0.55
+    frames = []
+    for second, spectrum in enumerate(frame_spectra):
         frames.append(
             draw_spectrum_frame(
                 Image,
