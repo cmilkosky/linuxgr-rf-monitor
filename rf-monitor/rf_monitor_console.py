@@ -1278,11 +1278,11 @@ HTML = r"""<!doctype html>
     :root { color-scheme: dark; --bg:#101418; --panel:#171d22; --line:#2b353d; --text:#e7edf2; --muted:#9caab5; --hot:#ffca62; --accent:#63d2ff; --bad:#ff6f91; }
     * { box-sizing: border-box; }
     body { margin: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; background: var(--bg); color: var(--text); }
-    header { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:14px 22px; border-bottom:1px solid var(--line); background:#12181d; position:sticky; top:0; z-index:3; }
+    header { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:10px 22px; border-bottom:1px solid var(--line); background:#12181d; position:sticky; top:0; z-index:3; }
     h1 { margin:0; font-size:20px; font-weight:650; }
     .brand { display:flex; align-items:center; gap:11px; border:0; background:transparent; color:var(--text); padding:3px 0; border-radius:8px; cursor:pointer; }
     .brand:hover { color:var(--hot); }
-    .brandMark { width:44px; height:44px; flex:0 0 44px; border:1px solid #35424c; border-radius:8px; background:#10161a; object-fit:cover; object-position:center; box-shadow:0 0 0 1px rgba(0,0,0,0.18) inset; }
+    .brandMark { width:58px; height:58px; flex:0 0 58px; border:1px solid #35424c; border-radius:8px; background:#10161a; object-fit:cover; object-position:center; box-shadow:0 0 0 1px rgba(0,0,0,0.18) inset; }
     .brand:hover .brandMark { border-color:var(--hot); }
     main { display:grid; grid-template-columns: 1fr 360px; min-height: calc(100vh - 64px); }
     section { padding:16px; }
@@ -1340,12 +1340,13 @@ HTML = r"""<!doctype html>
     #activityOverlay.active { display:flex; }
     .activityBadge { width:190px; min-height:172px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; border:1px solid #38505d; border-radius:8px; background:rgba(18,24,29,0.94); box-shadow:0 18px 54px rgba(0,0,0,0.34); }
     .radioLoader { position:relative; width:132px; height:132px; }
-    .radioLoader .loaderDish { position:absolute; left:14px; top:16px; width:104px; height:104px; border-radius:10px; object-fit:cover; object-position:center; filter:drop-shadow(0 12px 18px rgba(0,0,0,.38)); }
-    .radioLoader .radioWave { position:absolute; left:83px; top:35px; width:38px; height:38px; border:3px solid var(--accent); border-left-color:transparent; border-bottom-color:transparent; border-radius:50%; opacity:0; transform:rotate(36deg) scale(0.3); transform-origin:left bottom; animation:radioPulse 1.45s infinite ease-out; }
-    .radioLoader .radioWave:nth-child(2) { animation-delay:0.32s; }
-    .radioLoader .radioWave:nth-child(3) { animation-delay:0.64s; }
+    .radioLoader .loaderDish { position:absolute; left:14px; top:14px; z-index:1; width:104px; height:104px; border-radius:10px; object-fit:cover; object-position:center; filter:drop-shadow(0 12px 18px rgba(0,0,0,.38)); }
+    .radioLoader .radioWave { position:absolute; z-index:2; border:3px solid var(--accent); border-left-color:transparent; border-bottom-color:transparent; border-radius:50%; opacity:0; filter:drop-shadow(0 0 8px rgba(99,210,255,.75)); transform:rotate(8deg) scale(0.96); transform-origin:18% 78%; animation:radioPulse 1.45s infinite ease-in-out; }
+    .radioLoader .radioWave:nth-of-type(1) { left:88px; top:42px; width:24px; height:46px; animation-delay:0s; }
+    .radioLoader .radioWave:nth-of-type(2) { left:93px; top:31px; width:34px; height:68px; animation-delay:0.18s; opacity:0; }
+    .radioLoader .radioWave:nth-of-type(3) { left:98px; top:20px; width:45px; height:90px; animation-delay:0.36s; opacity:0; }
     .activityText { font-size:15px; font-weight:700; color:var(--text); text-transform:uppercase; letter-spacing:0; }
-    @keyframes radioPulse { 0% { opacity:0.9; transform:rotate(36deg) scale(0.28); } 100% { opacity:0; transform:rotate(36deg) scale(2.25); } }
+    @keyframes radioPulse { 0% { opacity:0.05; transform:rotate(8deg) translate(0,0) scale(0.94); } 38% { opacity:0.95; } 100% { opacity:0.08; transform:rotate(8deg) translate(6px,-3px) scale(1.08); } }
     @media (max-width: 1000px) { main { grid-template-columns: 1fr; } aside { border-left:0; border-top:1px solid var(--line); } #heatmapWrap { height: 60vh; } }
   </style>
 </head>
