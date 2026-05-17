@@ -1265,8 +1265,18 @@ HTML = r"""<!doctype html>
     :root { color-scheme: dark; --bg:#101418; --panel:#171d22; --line:#2b353d; --text:#e7edf2; --muted:#9caab5; --hot:#ffca62; --accent:#63d2ff; --bad:#ff6f91; }
     * { box-sizing: border-box; }
     body { margin: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; background: var(--bg); color: var(--text); }
-    header { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:18px 22px; border-bottom:1px solid var(--line); background:#12181d; position:sticky; top:0; z-index:3; }
+    header { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:14px 22px; border-bottom:1px solid var(--line); background:#12181d; position:sticky; top:0; z-index:3; }
     h1 { margin:0; font-size:20px; font-weight:650; }
+    .brand { display:flex; align-items:center; gap:11px; border:0; background:transparent; color:var(--text); padding:3px 0; border-radius:8px; cursor:pointer; }
+    .brand:hover { color:var(--hot); }
+    .brand:hover .antennaIcon { border-color:var(--hot); }
+    .antennaIcon { position:relative; width:42px; height:42px; flex:0 0 42px; border:1px solid #35424c; border-radius:8px; background:#151c21; overflow:hidden; }
+    .antennaIcon .mast { position:absolute; left:19px; bottom:8px; width:3px; height:25px; border-radius:3px; background:var(--accent); transform:rotate(-10deg); transform-origin:bottom; }
+    .antennaIcon .base { position:absolute; left:12px; bottom:7px; width:18px; height:3px; border-radius:3px; background:var(--hot); }
+    .antennaIcon .tip { position:absolute; left:16px; top:7px; width:8px; height:8px; border-radius:50%; background:var(--hot); box-shadow:0 0 12px rgba(255,202,98,0.65); }
+    .antennaIcon .wave { position:absolute; left:20px; top:10px; width:28px; height:28px; border:2px solid var(--accent); border-left-color:transparent; border-bottom-color:transparent; border-radius:50%; opacity:0.72; transform:rotate(45deg) scale(0.55); transform-origin:left bottom; }
+    .antennaIcon .wave.w2 { left:17px; top:4px; width:42px; height:42px; opacity:0.48; transform:rotate(45deg) scale(0.55); }
+    .antennaIcon .wave.w3 { left:13px; top:-3px; width:58px; height:58px; opacity:0.28; transform:rotate(45deg) scale(0.55); }
     main { display:grid; grid-template-columns: 1fr 360px; min-height: calc(100vh - 64px); }
     section { padding:16px; }
     aside { border-left:1px solid var(--line); background:#12181d; padding:16px; overflow:auto; }
@@ -1322,20 +1332,22 @@ HTML = r"""<!doctype html>
     #activityOverlay { position:fixed; inset:0; z-index:20; display:none; align-items:center; justify-content:center; background:rgba(9,13,16,0.58); backdrop-filter:blur(3px); }
     #activityOverlay.active { display:flex; }
     .activityBadge { width:190px; min-height:172px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; border:1px solid #38505d; border-radius:8px; background:rgba(18,24,29,0.94); box-shadow:0 18px 54px rgba(0,0,0,0.34); }
-    .radioLoader { position:relative; width:96px; height:96px; }
-    .radioLoader::before { content:""; position:absolute; left:38px; top:58px; width:20px; height:20px; border-radius:50%; background:var(--hot); box-shadow:0 0 18px rgba(255,202,98,0.75); }
-    .radioLoader::after { content:""; position:absolute; left:47px; top:18px; width:2px; height:54px; background:var(--accent); transform:rotate(-18deg); transform-origin:bottom; }
-    .radioWave { position:absolute; left:48px; top:48px; width:18px; height:18px; border:2px solid var(--accent); border-radius:50%; opacity:0; transform:translate(-50%,-50%) scale(0.3); animation:radioPulse 1.45s infinite ease-out; }
-    .radioWave:nth-child(2) { animation-delay:0.32s; }
-    .radioWave:nth-child(3) { animation-delay:0.64s; }
+    .radioLoader { position:relative; width:104px; height:104px; }
+    .radioLoader .antennaIcon { position:absolute; left:31px; top:31px; width:42px; height:42px; border-color:#38505d; background:#10161a; }
+    .radioLoader .radioWave { position:absolute; left:50px; top:28px; width:38px; height:38px; border:3px solid var(--accent); border-left-color:transparent; border-bottom-color:transparent; border-radius:50%; opacity:0; transform:rotate(45deg) scale(0.38); transform-origin:left bottom; animation:radioPulse 1.45s infinite ease-out; }
+    .radioLoader .radioWave:nth-child(2) { animation-delay:0.32s; }
+    .radioLoader .radioWave:nth-child(3) { animation-delay:0.64s; }
     .activityText { font-size:15px; font-weight:700; color:var(--text); text-transform:uppercase; letter-spacing:0; }
-    @keyframes radioPulse { 0% { opacity:0.9; transform:translate(-50%,-50%) scale(0.25); } 100% { opacity:0; transform:translate(-50%,-50%) scale(3.1); } }
+    @keyframes radioPulse { 0% { opacity:0.9; transform:rotate(45deg) scale(0.28); } 100% { opacity:0; transform:rotate(45deg) scale(1.9); } }
     @media (max-width: 1000px) { main { grid-template-columns: 1fr; } aside { border-left:0; border-top:1px solid var(--line); } #heatmapWrap { height: 60vh; } }
   </style>
 </head>
 <body>
 <header>
-  <h1>RF Monitor</h1>
+  <button id="homeBrand" class="brand" title="Reset RF Monitor home view" aria-label="Reset RF Monitor home view">
+    <span class="antennaIcon" aria-hidden="true"><span class="mast"></span><span class="base"></span><span class="tip"></span><span class="wave w1"></span><span class="wave w2"></span><span class="wave w3"></span></span>
+    <h1>RF Monitor</h1>
+  </button>
   <div class="muted" id="statusText">Loading</div>
 </header>
 <main>
@@ -1402,7 +1414,10 @@ HTML = r"""<!doctype html>
 </main>
 <div id="activityOverlay" aria-live="polite" aria-hidden="true">
   <div class="activityBadge">
-    <div class="radioLoader"><span class="radioWave"></span><span class="radioWave"></span><span class="radioWave"></span></div>
+    <div class="radioLoader">
+      <span class="radioWave"></span><span class="radioWave"></span><span class="radioWave"></span>
+      <span class="antennaIcon" aria-hidden="true"><span class="mast"></span><span class="base"></span><span class="tip"></span></span>
+    </div>
     <div id="activityText" class="activityText">Working</div>
   </div>
 </div>
@@ -1642,6 +1657,26 @@ function resetZoom() {
   hoverFreqHz = null;
   document.getElementById('zoomState').textContent = '';
   document.getElementById('hoverReadout').textContent = '';
+  load(false, 'Resetting View');
+}
+
+function resetHomeView() {
+  zoomMinHz = null;
+  zoomMaxHz = null;
+  hoverCell = null;
+  hoverFreqHz = null;
+  selectedFreqHz = null;
+  document.getElementById('zoomState').textContent = '';
+  document.getElementById('hoverReadout').textContent = '';
+  document.getElementById('toolbarSelected').textContent = 'No selection';
+  document.getElementById('selected').innerHTML = 'Click a heatmap block.';
+  document.getElementById('bandContext').innerHTML = 'Hover the colored rail or a heatmap block.';
+  document.getElementById('signalIntel').innerHTML = 'Select a frequency, then run Identify Signal.';
+  document.getElementById('captureStatus').innerHTML = 'Select a frequency to capture raw IQ and create a spectrogram. Capture controls are in the top bar.';
+  document.getElementById('captureBtn').disabled = true;
+  document.getElementById('deepScanBtn').disabled = true;
+  document.getElementById('identifyBtn').disabled = true;
+  drawDetail({series:{}});
   load(false, 'Resetting View');
 }
 
@@ -2071,6 +2106,7 @@ heat.addEventListener('mouseleave', () => {
 window.addEventListener('resize', () => { drawHeatmap(); drawDeepScan(); });
 document.getElementById('refresh').addEventListener('click', () => load(false, 'Refreshing'));
 document.getElementById('resetZoom').addEventListener('click', resetZoom);
+document.getElementById('homeBrand').addEventListener('click', resetHomeView);
 document.getElementById('captureBtn').addEventListener('click', captureSelected);
 document.getElementById('deepScanBtn').addEventListener('click', () => runFocusedScan());
 document.getElementById('identifyBtn').addEventListener('click', identifySelected);
