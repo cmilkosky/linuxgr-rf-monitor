@@ -91,6 +91,28 @@ def flux_duration(value: float, unit: str) -> str:
     return f"{seconds}s"
 
 
+def parse_bucket_seconds(bucket: str) -> int:
+    unit = bucket[-1]
+    value = int(bucket[:-1])
+    return value * {"s": 1, "m": 60, "h": 3600}[unit]
+
+
+def bucket_time_iso(value: str, bucket_seconds: int) -> str:
+    if bucket_seconds == 60:
+        return f"{value[:16]}:00Z"
+    clean = value[:-1] if value.endswith("Z") else value
+    if "." in clean:
+        head, tail = clean.split(".", 1)
+        tail = tail.split("+", 1)[0].split("-", 1)[0]
+        clean = f"{head}.{tail[:6].ljust(6, '0')}"
+    if "+" not in clean and not clean.endswith("+00:00"):
+        clean = f"{clean}+00:00"
+    dt = datetime.fromisoformat(clean)
+    epoch = int(dt.timestamp())
+    bucketed = epoch - (epoch % bucket_seconds)
+    return datetime.fromtimestamp(bucketed, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def run_command(command: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, text=True, capture_output=True, timeout=timeout, check=False)
 
@@ -519,24 +541,27 @@ from(bucket: "{INFLUX_BUCKET}")
   |> range(start: -{range_duration})
   |> filter(fn: (r) => r._measurement == "rf_sweep" and r._field == "rssi_db")
   {freq_filter}
-  |> aggregateWindow(every: {time_bucket}, fn: max, createEmpty: false)
-  |> map(fn: (r) => ({{ r with freq_bin: string(v: int(v: r.frequency_hz) / {step_hz} * {step_hz}) }}))
-  |> group(columns: ["_time", "freq_bin"])
-  |> max(column: "_value")
-  |> group()
-  |> keep(columns: ["_time", "freq_bin", "_value"])
+  |> keep(columns: ["_time", "_value", "frequency_hz"])
 '''
     rows = flux_query(query)
-    times = sorted({row["_time"] for row in rows})
-    freqs = sorted({int(row["freq_bin"]) for row in rows})
+    bucket_seconds = parse_bucket_seconds(time_bucket)
+    grouped: dict[tuple[str, int], float] = {}
+    for row in rows:
+        time_key = bucket_time_iso(row["_time"], bucket_seconds)
+        freq_bin = int(row["frequency_hz"]) // step_hz * step_hz
+        key = (time_key, freq_bin)
+        value = float(row["_value"])
+        if key not in grouped or value > grouped[key]:
+            grouped[key] = value
+    times = sorted({key[0] for key in grouped})
+    freqs = sorted({key[1] for key in grouped})
     time_index = {value: idx for idx, value in enumerate(times)}
     freq_index = {value: idx for idx, value in enumerate(freqs)}
     values: list[list[float | None]] = [[None for _ in times] for _ in freqs]
     min_v: float | None = None
     max_v: float | None = None
-    for row in rows:
-        value = float(row["_value"])
-        values[freq_index[int(row["freq_bin"])]][time_index[row["_time"]]] = value
+    for (time_key, freq_bin), value in grouped.items():
+        values[freq_index[freq_bin]][time_index[time_key]] = value
         min_v = value if min_v is None else min(min_v, value)
         max_v = value if max_v is None else max(max_v, value)
     return JSONResponse(
@@ -547,7 +572,8 @@ from(bucket: "{INFLUX_BUCKET}")
             "values": values,
             "min": min_v,
             "max": max_v,
-            "points": len(rows),
+            "points": len(grouped),
+            "raw_points": len(rows),
             "freq_min_hz": freq_min_hz,
             "freq_max_hz": freq_max_hz,
         }
