@@ -1030,6 +1030,17 @@ HTML = r"""<!doctype html>
     audio { width:100%; height:32px; }
     #zoomState { color: var(--hot); }
     #detailCanvas { height:220px; margin-top:10px; }
+    #activityOverlay { position:fixed; inset:0; z-index:20; display:none; align-items:center; justify-content:center; background:rgba(9,13,16,0.58); backdrop-filter:blur(3px); }
+    #activityOverlay.active { display:flex; }
+    .activityBadge { width:190px; min-height:172px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; border:1px solid #38505d; border-radius:8px; background:rgba(18,24,29,0.94); box-shadow:0 18px 54px rgba(0,0,0,0.34); }
+    .radioLoader { position:relative; width:96px; height:96px; }
+    .radioLoader::before { content:""; position:absolute; left:38px; top:58px; width:20px; height:20px; border-radius:50%; background:var(--hot); box-shadow:0 0 18px rgba(255,202,98,0.75); }
+    .radioLoader::after { content:""; position:absolute; left:47px; top:18px; width:2px; height:54px; background:var(--accent); transform:rotate(-18deg); transform-origin:bottom; }
+    .radioWave { position:absolute; left:48px; top:48px; width:18px; height:18px; border:2px solid var(--accent); border-radius:50%; opacity:0; transform:translate(-50%,-50%) scale(0.3); animation:radioPulse 1.45s infinite ease-out; }
+    .radioWave:nth-child(2) { animation-delay:0.32s; }
+    .radioWave:nth-child(3) { animation-delay:0.64s; }
+    .activityText { font-size:15px; font-weight:700; color:var(--text); text-transform:uppercase; letter-spacing:0; }
+    @keyframes radioPulse { 0% { opacity:0.9; transform:translate(-50%,-50%) scale(0.25); } 100% { opacity:0; transform:translate(-50%,-50%) scale(3.1); } }
     @media (max-width: 1000px) { main { grid-template-columns: 1fr; } aside { border-left:0; border-top:1px solid var(--line); } #heatmapWrap { height: 60vh; } }
   </style>
 </head>
@@ -1095,6 +1106,12 @@ HTML = r"""<!doctype html>
     <div id="top" class="list"></div>
   </aside>
 </main>
+<div id="activityOverlay" aria-live="polite" aria-hidden="true">
+  <div class="activityBadge">
+    <div class="radioLoader"><span class="radioWave"></span><span class="radioWave"></span><span class="radioWave"></span></div>
+    <div id="activityText" class="activityText">Working</div>
+  </div>
+</div>
 <script>
 const heat = document.getElementById('heatmap');
 const detail = document.getElementById('detailCanvas');
@@ -1108,6 +1125,30 @@ let selectedFreqHz = null;
 let captureRunning = false;
 let deepScanRunning = false;
 let deepScanData = null;
+let activityTokens = new Set();
+
+function showActivity(label) {
+  const token = Symbol(label);
+  activityTokens.add(token);
+  document.getElementById('activityText').textContent = label;
+  const overlay = document.getElementById('activityOverlay');
+  overlay.classList.add('active');
+  overlay.setAttribute('aria-hidden', 'false');
+  return {token, started: Date.now()};
+}
+
+function hideActivity(activity) {
+  if (!activity) return;
+  const remainingMs = Math.max(0, 450 - (Date.now() - activity.started));
+  window.setTimeout(() => {
+    activityTokens.delete(activity.token);
+    if (!activityTokens.size) {
+      const overlay = document.getElementById('activityOverlay');
+      overlay.classList.remove('active');
+      overlay.setAttribute('aria-hidden', 'true');
+    }
+  }, remainingMs);
+}
 
 const BAND_REFS = [
   {name:'VHF', min:30, max:300, info:'30-300 MHz. FM broadcast, airband, marine, weather radio, amateur 6m/2m, and other land-mobile activity can appear here.'},
@@ -1307,7 +1348,7 @@ function resetZoom() {
   hoverFreqHz = null;
   document.getElementById('zoomState').textContent = '';
   document.getElementById('hoverReadout').textContent = '';
-  load();
+  load(false, 'Resetting View');
 }
 
 async function selectFrequency(freq) {
@@ -1405,6 +1446,7 @@ function focusedPeakHtml(data) {
 
 async function runFocusedScan(freq=selectedFreqHz) {
   if (!freq || deepScanRunning) return;
+  const activity = showActivity('Focused Scan');
   deepScanRunning = true;
   document.getElementById('deepScanBtn').disabled = true;
   document.getElementById('deepScanStatus').innerHTML = `<b>${(freq/1e6).toFixed(3)} MHz</b><br>Running focused scan...`;
@@ -1434,10 +1476,12 @@ async function runFocusedScan(freq=selectedFreqHz) {
   } finally {
     deepScanRunning = false;
     document.getElementById('deepScanBtn').disabled = selectedFreqHz === null;
+    hideActivity(activity);
   }
 }
 
-async function load(quick=false) {
+async function load(quick=false, activityLabel=null) {
+  const activity = activityLabel ? showActivity(activityLabel) : null;
   document.getElementById('statusText').textContent = quick ? 'Loading quick heatmap' : 'Loading heatmap';
   const selectedHours = document.getElementById('hours').value;
   const hours = quick && zoomMinHz === null && zoomMaxHz === null ? '0.25' : selectedHours;
@@ -1467,6 +1511,7 @@ async function load(quick=false) {
   }
   loadStatusPanels();
   loadCaptures();
+  hideActivity(activity);
 }
 
 async function initialLoad() {
@@ -1560,6 +1605,7 @@ async function loadCaptures() {
 
 async function captureSelected() {
   if (!selectedFreqHz || captureRunning) return;
+  const activity = showActivity('Capturing');
   const seconds = Number(document.getElementById('captureSeconds').value);
   const sampleRate = Number(document.getElementById('captureRate').value);
   captureRunning = true;
@@ -1583,6 +1629,7 @@ async function captureSelected() {
   } finally {
     captureRunning = false;
     document.getElementById('captureBtn').disabled = selectedFreqHz === null;
+    hideActivity(activity);
   }
 }
 
@@ -1593,7 +1640,7 @@ heat.addEventListener('click', e => {
   if (freq) {
     zoomAround(freq);
     selectFrequency(freq);
-    load();
+    load(false, 'Zooming In');
   }
 });
 heat.addEventListener('dblclick', e => {
@@ -1603,7 +1650,7 @@ heat.addEventListener('dblclick', e => {
   if (freq) {
     zoomAround(freq);
     selectFrequency(freq);
-    load();
+    load(false, 'Zooming In');
     runFocusedScan(freq);
   }
 });
@@ -1632,7 +1679,7 @@ heat.addEventListener('mouseleave', () => {
   drawHeatmap();
 });
 window.addEventListener('resize', () => { drawHeatmap(); drawDeepScan(); });
-document.getElementById('refresh').addEventListener('click', load);
+document.getElementById('refresh').addEventListener('click', () => load(false, 'Refreshing'));
 document.getElementById('resetZoom').addEventListener('click', resetZoom);
 document.getElementById('captureBtn').addEventListener('click', captureSelected);
 document.getElementById('deepScanBtn').addEventListener('click', () => runFocusedScan());
