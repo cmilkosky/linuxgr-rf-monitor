@@ -17,7 +17,7 @@ This repo is the working implementation for a home RF baseline/anomaly project. 
 
 ```mermaid
 flowchart LR
-    HackRF["HackRF One"] --> Sweep["hackrf_sweep<br/>400-6000 MHz<br/>1 MHz bins"]
+    HackRF["HackRF One"] --> Sweep["hackrf_sweep<br/>30-6000 MHz<br/>1 MHz bins"]
     Sweep --> Collector["hackrf_influx_collector.py"]
     Collector --> Influx["InfluxDB OSS v2<br/>bucket: rf_monitoring"]
     Influx --> Console["RF Monitor Console<br/>FastAPI + Canvas UI<br/>port 8099"]

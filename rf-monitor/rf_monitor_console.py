@@ -823,7 +823,13 @@ let selectedFreqHz = null;
 let captureRunning = false;
 
 const BAND_REFS = [
-  {name:'UHF', min:300, max:3000, info:'Broad 300-3000 MHz band. Your current sweep sees the 400-3000 MHz portion.'},
+  {name:'VHF', min:30, max:300, info:'30-300 MHz. FM broadcast, airband, marine, weather radio, amateur 6m/2m, and other land-mobile activity can appear here.'},
+  {name:'6 m amateur', min:50, max:54, info:'Amateur radio allocation in the United States.'},
+  {name:'FM broadcast', min:88, max:108, info:'Commercial FM broadcast band.'},
+  {name:'Airband', min:108, max:137, info:'Civil aviation navigation and AM voice communications.'},
+  {name:'2 m amateur', min:144, max:148, info:'Amateur radio allocation in the United States.'},
+  {name:'NOAA weather', min:162.4, max:162.55, info:'NOAA Weather Radio channels in the United States.'},
+  {name:'UHF', min:300, max:3000, info:'Broad 300-3000 MHz band.'},
   {name:'L-band', min:1000, max:2000, info:'Satellite, GNSS, aircraft, and other microwave services often appear here.'},
   {name:'S-band', min:2000, max:4000, info:'Microwave band with radar, satellite, Wi-Fi/ISM, and amateur allocations.'},
   {name:'C-band', min:4000, max:8000, info:'Microwave band. Your current sweep sees the 4000-5995 MHz portion.'},
