@@ -27,6 +27,7 @@ CONFIG_PATH = Path(os.environ.get("RF_MONITOR_ENV", "/home/cmilkosk/.config/hack
 STATUS_PATH = Path(os.environ.get("RF_MONITOR_STATUS", "/home/cmilkosk/rf-monitor/status.json"))
 CAPTURE_DIR = Path(os.environ.get("RF_CAPTURE_DIR", "/home/cmilkosk/rf-monitor/captures"))
 DEEP_SCAN_DIR = Path(os.environ.get("RF_DEEP_SCAN_DIR", "/home/cmilkosk/rf-monitor/deep-scans"))
+ASSET_DIR = Path(os.environ.get("RF_ASSET_DIR", "/home/cmilkosk/rf-monitor/assets"))
 DEVICE_LOCK_PATH = Path(os.environ.get("RF_HACKRF_LOCK", "/tmp/hackrf-monitor-device.lock"))
 CAPTURE_LOCK = threading.Lock()
 DEEP_SCAN_LOCK = threading.Lock()
@@ -925,6 +926,18 @@ def health() -> JSONResponse:
     return JSONResponse({"ok": influx.get("status") == "pass", "influx": influx, "status": read_status()})
 
 
+@app.get("/assets/{asset_name}")
+def asset(asset_name: str) -> FileResponse:
+    safe_name = "".join(ch for ch in asset_name if ch.isalnum() or ch in "-_.")
+    if safe_name != asset_name:
+        raise HTTPException(400, "Invalid asset name")
+    path = ASSET_DIR / asset_name
+    if not path.exists():
+        raise HTTPException(404, "Asset not found")
+    media_type = "image/png" if path.suffix.lower() == ".png" else "application/octet-stream"
+    return FileResponse(path, media_type=media_type)
+
+
 @app.get("/api/heatmap")
 def heatmap(
     hours: float = Query(3, ge=0.1, le=24),
@@ -1269,14 +1282,8 @@ HTML = r"""<!doctype html>
     h1 { margin:0; font-size:20px; font-weight:650; }
     .brand { display:flex; align-items:center; gap:11px; border:0; background:transparent; color:var(--text); padding:3px 0; border-radius:8px; cursor:pointer; }
     .brand:hover { color:var(--hot); }
-    .brand:hover .antennaIcon { border-color:var(--hot); }
-    .antennaIcon { position:relative; width:42px; height:42px; flex:0 0 42px; border:1px solid #35424c; border-radius:8px; background:#151c21; overflow:hidden; }
-    .antennaIcon .mast { position:absolute; left:19px; bottom:8px; width:3px; height:25px; border-radius:3px; background:var(--accent); transform:rotate(-10deg); transform-origin:bottom; }
-    .antennaIcon .base { position:absolute; left:12px; bottom:7px; width:18px; height:3px; border-radius:3px; background:var(--hot); }
-    .antennaIcon .tip { position:absolute; left:16px; top:7px; width:8px; height:8px; border-radius:50%; background:var(--hot); box-shadow:0 0 12px rgba(255,202,98,0.65); }
-    .antennaIcon .wave { position:absolute; left:20px; top:10px; width:28px; height:28px; border:2px solid var(--accent); border-left-color:transparent; border-bottom-color:transparent; border-radius:50%; opacity:0.72; transform:rotate(45deg) scale(0.55); transform-origin:left bottom; }
-    .antennaIcon .wave.w2 { left:17px; top:4px; width:42px; height:42px; opacity:0.48; transform:rotate(45deg) scale(0.55); }
-    .antennaIcon .wave.w3 { left:13px; top:-3px; width:58px; height:58px; opacity:0.28; transform:rotate(45deg) scale(0.55); }
+    .brandMark { width:44px; height:44px; flex:0 0 44px; border:1px solid #35424c; border-radius:8px; background:#10161a; object-fit:cover; object-position:center; box-shadow:0 0 0 1px rgba(0,0,0,0.18) inset; }
+    .brand:hover .brandMark { border-color:var(--hot); }
     main { display:grid; grid-template-columns: 1fr 360px; min-height: calc(100vh - 64px); }
     section { padding:16px; }
     aside { border-left:1px solid var(--line); background:#12181d; padding:16px; overflow:auto; }
@@ -1332,20 +1339,20 @@ HTML = r"""<!doctype html>
     #activityOverlay { position:fixed; inset:0; z-index:20; display:none; align-items:center; justify-content:center; background:rgba(9,13,16,0.58); backdrop-filter:blur(3px); }
     #activityOverlay.active { display:flex; }
     .activityBadge { width:190px; min-height:172px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; border:1px solid #38505d; border-radius:8px; background:rgba(18,24,29,0.94); box-shadow:0 18px 54px rgba(0,0,0,0.34); }
-    .radioLoader { position:relative; width:104px; height:104px; }
-    .radioLoader .antennaIcon { position:absolute; left:31px; top:31px; width:42px; height:42px; border-color:#38505d; background:#10161a; }
-    .radioLoader .radioWave { position:absolute; left:50px; top:28px; width:38px; height:38px; border:3px solid var(--accent); border-left-color:transparent; border-bottom-color:transparent; border-radius:50%; opacity:0; transform:rotate(45deg) scale(0.38); transform-origin:left bottom; animation:radioPulse 1.45s infinite ease-out; }
+    .radioLoader { position:relative; width:132px; height:132px; }
+    .radioLoader .loaderDish { position:absolute; left:14px; top:16px; width:104px; height:104px; border-radius:10px; object-fit:cover; object-position:center; filter:drop-shadow(0 12px 18px rgba(0,0,0,.38)); }
+    .radioLoader .radioWave { position:absolute; left:83px; top:35px; width:38px; height:38px; border:3px solid var(--accent); border-left-color:transparent; border-bottom-color:transparent; border-radius:50%; opacity:0; transform:rotate(36deg) scale(0.3); transform-origin:left bottom; animation:radioPulse 1.45s infinite ease-out; }
     .radioLoader .radioWave:nth-child(2) { animation-delay:0.32s; }
     .radioLoader .radioWave:nth-child(3) { animation-delay:0.64s; }
     .activityText { font-size:15px; font-weight:700; color:var(--text); text-transform:uppercase; letter-spacing:0; }
-    @keyframes radioPulse { 0% { opacity:0.9; transform:rotate(45deg) scale(0.28); } 100% { opacity:0; transform:rotate(45deg) scale(1.9); } }
+    @keyframes radioPulse { 0% { opacity:0.9; transform:rotate(36deg) scale(0.28); } 100% { opacity:0; transform:rotate(36deg) scale(2.25); } }
     @media (max-width: 1000px) { main { grid-template-columns: 1fr; } aside { border-left:0; border-top:1px solid var(--line); } #heatmapWrap { height: 60vh; } }
   </style>
 </head>
 <body>
 <header>
   <button id="homeBrand" class="brand" title="Reset RF Monitor home view" aria-label="Reset RF Monitor home view">
-    <span class="antennaIcon" aria-hidden="true"><span class="mast"></span><span class="base"></span><span class="tip"></span><span class="wave w1"></span><span class="wave w2"></span><span class="wave w3"></span></span>
+    <img class="brandMark" src="/assets/rf-dish-antenna.png" alt="" aria-hidden="true">
     <h1>RF Monitor</h1>
   </button>
   <div class="muted" id="statusText">Loading</div>
@@ -1416,7 +1423,7 @@ HTML = r"""<!doctype html>
   <div class="activityBadge">
     <div class="radioLoader">
       <span class="radioWave"></span><span class="radioWave"></span><span class="radioWave"></span>
-      <span class="antennaIcon" aria-hidden="true"><span class="mast"></span><span class="base"></span><span class="tip"></span></span>
+      <img class="loaderDish" src="/assets/rf-dish-antenna.png" alt="" aria-hidden="true">
     </div>
     <div id="activityText" class="activityText">Working</div>
   </div>
