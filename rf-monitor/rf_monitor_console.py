@@ -218,6 +218,25 @@ def deep_scan_path(scan_id: str, suffix: str) -> Path:
     return DEEP_SCAN_DIR / f"{safe_id}{suffix}"
 
 
+def gif_still_path(gif_path: Path) -> Path:
+    return gif_path.with_suffix(".still.png")
+
+
+def ensure_gif_still(gif_path: Path) -> Path:
+    if not gif_path.exists():
+        raise HTTPException(404, "Animation not found")
+    still_path = gif_still_path(gif_path)
+    if still_path.exists() and still_path.stat().st_mtime >= gif_path.stat().st_mtime:
+        return still_path
+    from PIL import Image
+
+    with Image.open(gif_path) as image:
+        image.seek(0)
+        still_path.parent.mkdir(parents=True, exist_ok=True)
+        image.convert("RGB").save(still_path)
+    return still_path
+
+
 def find_peak_points(points: list[dict[str, float]], limit: int = 5) -> list[dict[str, float]]:
     if not points:
         return []
@@ -394,6 +413,7 @@ def run_deep_scan(center_frequency_hz: int, span_mhz: int, bin_width_hz: int) ->
             "frequency_gaps_mhz": [{"start_mhz": start, "end_mhz": end} for start, end in gaps],
             "frame_count": len(frames),
             "animation_url": f"/api/deep-scans/{scan_id}/animation",
+            "still_url": f"/api/deep-scans/{scan_id}/still",
             "command": command,
             "sweep_was_active": sweep_was_active,
         }
@@ -422,6 +442,7 @@ def capture_record(meta_path: Path) -> dict[str, Any]:
     data["iq_url"] = f"/api/captures/{capture_id}/iq"
     data["spectrogram_url"] = f"/api/captures/{capture_id}/spectrogram"
     data["animation_url"] = f"/api/captures/{capture_id}/animation"
+    data["animation_still_url"] = f"/api/captures/{capture_id}/animation-still"
     data["audio_urls"] = {
         "am": f"/api/captures/{capture_id}/audio/am",
         "nfm": f"/api/captures/{capture_id}/audio/nfm",
@@ -958,6 +979,12 @@ def deep_scan_animation(scan_id: str) -> FileResponse:
     return FileResponse(path, media_type="image/gif")
 
 
+@app.get("/api/deep-scans/{scan_id}/still")
+def deep_scan_still(scan_id: str) -> FileResponse:
+    path = ensure_gif_still(deep_scan_path(scan_id, ".gif"))
+    return FileResponse(path, media_type="image/png")
+
+
 @app.get("/api/captures/{capture_id}/meta")
 def capture_meta(capture_id: str) -> JSONResponse:
     path = capture_path(capture_id, ".json")
@@ -995,6 +1022,27 @@ def capture_animation(capture_id: str) -> FileResponse:
     return FileResponse(path, media_type="image/gif")
 
 
+@app.get("/api/captures/{capture_id}/animation-still")
+def capture_animation_still(capture_id: str) -> FileResponse:
+    path = capture_path(capture_id, ".gif")
+    if not path.exists():
+        meta_path = capture_path(capture_id, ".json")
+        iq_path = capture_path(capture_id, ".iq")
+        png_path = capture_path(capture_id, ".png")
+        if not meta_path.exists() or not iq_path.exists():
+            raise HTTPException(404, "Animation not found")
+        meta = json.loads(meta_path.read_text())
+        meta["analysis"] = summarize_iq(
+            iq_path,
+            int(meta["sample_rate_hz"]),
+            int(meta["frequency_hz"]),
+            png_path,
+            path,
+        )
+        meta_path.write_text(json.dumps(meta, indent=2))
+    return FileResponse(ensure_gif_still(path), media_type="image/png")
+
+
 @app.get("/api/captures/{capture_id}/audio/{mode}")
 def capture_audio(capture_id: str, mode: str) -> FileResponse:
     path = ensure_audio_preview(capture_id, mode)
@@ -1025,6 +1073,8 @@ HTML = r"""<!doctype html>
     section { padding:16px; }
     aside { border-left:1px solid var(--line); background:#12181d; padding:16px; overflow:auto; }
     .toolbar { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:12px; }
+    .toolbarGroup { display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:6px 8px; border:1px solid var(--line); border-radius:8px; background:#141b20; }
+    .selectedChip { color:var(--hot); font-weight:700; min-width:94px; }
     select, button { background:#202a31; color:var(--text); border:1px solid #35424c; border-radius:6px; padding:7px 10px; font:inherit; }
     button { cursor:pointer; }
     button:hover { border-color:var(--accent); }
@@ -1053,10 +1103,13 @@ HTML = r"""<!doctype html>
     .captureImg { width:100%; border:1px solid var(--line); border-radius:8px; margin-top:8px; background:#0c1013; cursor:zoom-in; }
     .captureCaption { color:var(--muted); font-size:12px; line-height:1.35; margin-top:6px; }
     .captureToggle { display:flex; gap:6px; margin-top:8px; }
+    .selectedPanel { position:sticky; top:0; z-index:2; padding-bottom:10px; background:#12181d; }
     .deepScanBox { margin-top:12px; border:1px solid var(--line); background:var(--panel); border-radius:8px; padding:10px; }
     .deepScanBox h4 { margin:0 0 6px; font-size:13px; }
     #deepScanCanvas { height:190px; margin-top:10px; }
     .deepScanImg { width:100%; border:1px solid var(--line); border-radius:8px; margin-top:10px; background:#0c1013; cursor:zoom-in; }
+    .mediaShell { position:relative; }
+    .pausePill { position:absolute; right:8px; top:18px; padding:4px 7px; border-radius:6px; background:rgba(16,20,24,0.86); color:var(--text); border:1px solid var(--line); font-size:12px; pointer-events:none; }
     .peakList { color:var(--muted); font-size:12px; line-height:1.45; margin-top:8px; }
     .audioPreview { margin-top:10px; display:flex; flex-direction:column; gap:8px; }
     .audioRow { display:grid; grid-template-columns: 42px 1fr 44px; align-items:center; gap:8px; color:var(--muted); font-size:12px; }
@@ -1090,6 +1143,17 @@ HTML = r"""<!doctype html>
       <label>Frequency bin <select id="freqStep"><option>1</option><option selected>5</option><option>10</option><option>25</option><option>50</option></select> MHz</label>
       <button id="refresh">Refresh</button>
       <button id="resetZoom">Reset Zoom</button>
+      <div class="toolbarGroup">
+        <span class="selectedChip" id="toolbarSelected">No selection</span>
+        <label>Span <select id="deepSpan"><option value="10">10 MHz</option><option value="20" selected>20 MHz</option><option value="50">50 MHz</option></select></label>
+        <label>Bin <select id="deepBin"><option value="25000">25 kHz</option><option value="50000">50 kHz</option><option value="100000" selected>100 kHz</option><option value="250000">250 kHz</option></select></label>
+        <button id="deepScanBtn" class="primaryBtn" disabled>Focused Scan</button>
+      </div>
+      <div class="toolbarGroup">
+        <label>Seconds <select id="captureSeconds"><option>2</option><option selected>4</option><option>8</option><option>12</option></select></label>
+        <label>Rate <select id="captureRate"><option value="2000000">2 Msps</option><option value="5000000" selected>5 Msps</option><option value="10000000">10 Msps</option></select></label>
+        <button id="captureBtn" class="primaryBtn" disabled>Capture Signal</button>
+      </div>
       <span class="muted" id="legend">Color = RSSI strength; left rail = frequency context</span>
       <span id="hoverReadout" class="readout"></span>
       <span id="zoomState"></span>
@@ -1097,23 +1161,21 @@ HTML = r"""<!doctype html>
     <div id="heatmapWrap" class="panel"><canvas id="heatmap"></canvas></div>
   </section>
   <aside>
-    <div class="stats">
-      <div class="stat"><strong id="sweeps">--</strong><span>points loaded</span></div>
-      <div class="stat"><strong id="activeAnoms">--</strong><span>active anomalies</span></div>
-      <div class="stat"><strong id="maxRssi">--</strong><span>max RSSI</span></div>
+    <div class="selectedPanel">
+      <div class="stats">
+        <div class="stat"><strong id="sweeps">--</strong><span>points loaded</span></div>
+        <div class="stat"><strong id="activeAnoms">--</strong><span>active anomalies</span></div>
+        <div class="stat"><strong id="maxRssi">--</strong><span>max RSSI</span></div>
+      </div>
+      <h3>Selected</h3>
+      <div id="selected" class="muted">Click a heatmap block.</div>
+      <canvas id="detailCanvas" class="panel"></canvas>
+      <div class="hint">Detail graph: RSSI over the last 6 hours for the selected frequency and nearby bins. Each colored line is one neighboring bin; spikes mean that bin got stronger during that time.</div>
     </div>
-    <h3>Selected</h3>
-    <div id="selected" class="muted">Click a heatmap block.</div>
-    <canvas id="detailCanvas" class="panel"></canvas>
-    <div class="hint">Detail graph: RSSI over the last 6 hours for the selected frequency and nearby bins. Each colored line is one neighboring bin; spikes mean that bin got stronger during that time.</div>
+    <h3>Activity</h3>
     <div class="deepScanBox">
       <h4>Focused Scan</h4>
       <div id="deepScanStatus" class="muted">Zoom into a frequency, then double-click a heatmap block or run a focused scan here.</div>
-      <div class="captureActions">
-        <label>Span <select id="deepSpan"><option value="10">10 MHz</option><option value="20" selected>20 MHz</option><option value="50">50 MHz</option></select></label>
-        <label>Bin <select id="deepBin"><option value="25000">25 kHz</option><option value="50000">50 kHz</option><option value="100000" selected>100 kHz</option><option value="250000">250 kHz</option></select></label>
-        <button id="deepScanBtn" class="primaryBtn" disabled>Focused Scan</button>
-      </div>
       <canvas id="deepScanCanvas" class="panel"></canvas>
       <div id="deepScanMedia"></div>
       <div class="hint">Focused scans briefly pause the wide sweep and take a high-resolution look around the selected frequency. They are animated snapshots, separate from the always-on 1 MHz baseline.</div>
@@ -1123,16 +1185,7 @@ HTML = r"""<!doctype html>
       <div id="bandContext" class="muted">Hover the colored rail or a heatmap block.</div>
       <div class="hint">Reference ranges are approximate and meant for orientation, not as an authoritative band plan.</div>
     </div>
-    <h3>Capture</h3>
-    <div class="contextBox">
-    <div id="captureStatus" class="muted">Select a frequency to capture raw IQ and create a spectrogram.</div>
-      <div class="captureActions">
-        <label>Seconds <select id="captureSeconds"><option>2</option><option selected>4</option><option>8</option><option>12</option></select></label>
-        <label>Rate <select id="captureRate"><option value="2000000">2 Msps</option><option value="5000000" selected>5 Msps</option><option value="10000000">10 Msps</option></select></label>
-        <button id="captureBtn" class="primaryBtn" disabled>Capture Signal</button>
-      </div>
-      <div class="hint">Capture briefly pauses the wideband sweep, records HackRF IQ around the selected frequency, then resumes sweeping. Audio previews are demodulation guesses; many digital signals will sound like noise.</div>
-    </div>
+    <div id="captureStatus" class="hint">Select a frequency to capture raw IQ and create a spectrogram. Capture controls are in the top bar.</div>
     <div id="captures" class="list"></div>
     <h3>Anomalies</h3>
     <div id="anomalies" class="list"></div>
@@ -1389,6 +1442,7 @@ async function selectFrequency(freq) {
   selectedFreqHz = freq;
   document.getElementById('captureBtn').disabled = captureRunning ? true : false;
   document.getElementById('deepScanBtn').disabled = deepScanRunning ? true : false;
+  document.getElementById('toolbarSelected').textContent = `${(freq/1e6).toFixed(3)} MHz`;
   document.getElementById('selected').innerHTML = `<b>${(freq/1e6).toFixed(3)} MHz</b><br><span class="muted">Loading detail...</span>`;
   updateBandContext(freq);
   const data = await fetch(`/api/frequency/${freq}?hours=6&span_mhz=2`).then(r=>r.json());
@@ -1493,6 +1547,18 @@ function focusedPeakHtml(data) {
     `</div>`;
 }
 
+function toggleGifPreview(imgId) {
+  const img = document.getElementById(imgId);
+  if (!img) return;
+  const playing = img.dataset.playing !== 'false';
+  const nextUrl = playing ? img.dataset.stillUrl : img.dataset.animationUrl;
+  if (!nextUrl) return;
+  img.dataset.playing = playing ? 'false' : 'true';
+  img.src = `${nextUrl}?t=${Date.now()}`;
+  const pill = document.getElementById(`${imgId}-pill`);
+  if (pill) pill.textContent = playing ? 'Paused' : 'Playing';
+}
+
 async function runFocusedScan(freq=selectedFreqHz) {
   if (!freq || deepScanRunning) return;
   const activity = showActivity('Focused Scan');
@@ -1516,9 +1582,10 @@ async function runFocusedScan(freq=selectedFreqHz) {
     document.getElementById('deepScanStatus').innerHTML =
       `<b>${data.center_frequency_mhz.toFixed(3)} MHz focused scan</b><br>` +
       `<span class="muted">${data.points.length} bins · ${data.bin_width_khz.toFixed(0)} kHz · ${data.frame_count || 1} frames${gapNote} · peak ${peak.frequency_mhz.toFixed(6)} MHz at ${peak.rssi_db.toFixed(1)} dB</span>`;
+    const deepImgId = `deep-scan-img-${data.id}`;
     document.getElementById('deepScanMedia').innerHTML =
-      `<img class="deepScanImg" ondblclick="window.open('${data.animation_url}', '_blank')" src="${data.animation_url}?t=${encodeURIComponent(data.completed_at)}" alt="Animated focused scan around ${data.center_frequency_mhz.toFixed(3)} MHz">` +
-      `<div class="captureActions"><button class="smallBtn" onclick="window.open('${data.animation_url}', '_blank')">View Larger</button></div>` +
+      `<div class="mediaShell"><img id="${deepImgId}" class="deepScanImg" data-playing="true" data-animation-url="${data.animation_url}" data-still-url="${data.still_url}" onclick="toggleGifPreview('${deepImgId}')" ondblclick="window.open('${data.animation_url}', '_blank')" src="${data.animation_url}?t=${encodeURIComponent(data.completed_at)}" alt="Animated focused scan around ${data.center_frequency_mhz.toFixed(3)} MHz"><span id="${deepImgId}-pill" class="pausePill">Playing</span></div>` +
+      `<div class="captureActions"><button class="smallBtn" onclick="toggleGifPreview('${deepImgId}')">Play / Pause</button><button class="smallBtn" onclick="window.open('${data.animation_url}', '_blank')">View Larger</button></div>` +
       focusedPeakHtml(data);
     drawDeepScan();
   } catch (err) {
@@ -1600,7 +1667,7 @@ function captureItemHtml(capture) {
       <button class="smallBtn" onclick="showCaptureArtifact('${capture.id}', '${capture.animation_url}', 'animation')">Animation</button>
       <button class="smallBtn" onclick="showCaptureArtifact('${capture.id}', '${capture.spectrogram_url}', 'spectrogram')">Spectrogram</button>
     </div>
-    <img id="capture-img-${capture.id}" class="captureImg" onclick="openCaptureArtifact('${capture.id}')" data-current-url="${capture.animation_url}" src="${capture.animation_url}?t=${encodeURIComponent(capture.completed_at || capture.started_at)}" alt="Animated spectrum for ${capture.frequency_mhz.toFixed(3)} MHz capture">
+    <div class="mediaShell"><img id="capture-img-${capture.id}" class="captureImg" onclick="toggleGifPreview('capture-img-${capture.id}')" ondblclick="openCaptureArtifact('${capture.id}')" data-playing="true" data-animation-url="${capture.animation_url}" data-still-url="${capture.animation_still_url}" data-current-url="${capture.animation_url}" src="${capture.animation_url}?t=${encodeURIComponent(capture.completed_at || capture.started_at)}" alt="Animated spectrum for ${capture.frequency_mhz.toFixed(3)} MHz capture"><span id="capture-img-${capture.id}-pill" class="pausePill">Playing</span></div>
     <div id="capture-caption-${capture.id}" class="captureCaption">Animated spectrum: each frame is about 1 second. X axis is frequency, Y axis is relative strength. Download IQ is the raw radio sample file for later demodulation/classification.</div>
     <div class="audioPreview">
       <div class="audioRow"><span>AM</span><audio controls preload="metadata"><source src="${audioSrc('am')}" type="audio/wav"></audio><a class="audioLink" href="${audioSrc('am')}" target="_blank">Open</a></div>
@@ -1615,6 +1682,7 @@ function captureItemHtml(capture) {
     <span class="muted">${capture.started_at}</span>
     <div class="captureActions">
       <button class="smallBtn" onclick="selectFrequency(${capture.frequency_hz})">Select</button>
+      <button class="smallBtn" onclick="toggleGifPreview('capture-img-${capture.id}')">Play / Pause</button>
       <button class="smallBtn" onclick="window.open('${capture.animation_url}', '_blank')">View Animation</button>
       <button class="smallBtn" onclick="window.open('${capture.spectrogram_url}', '_blank')">View Spectrogram</button>
       <button class="smallBtn" onclick="window.open('${capture.meta_url}', '_blank')">Details</button>
@@ -1629,12 +1697,16 @@ function showCaptureArtifact(captureId, url, kind) {
   const caption = document.getElementById(`capture-caption-${captureId}`);
   if (!img || !caption) return;
   img.dataset.currentUrl = url;
+  img.dataset.playing = kind === 'animation' ? 'true' : 'false';
   img.src = `${url}?t=${Date.now()}`;
+  const pill = document.getElementById(`capture-img-${captureId}-pill`);
   if (kind === 'animation') {
     img.alt = 'Animated spectrum view';
+    if (pill) pill.textContent = 'Playing';
     caption.textContent = 'Animated spectrum: each frame is about 1 second. X axis is frequency, Y axis is relative strength. Download IQ is the raw radio sample file for later demodulation/classification.';
   } else {
     img.alt = 'Spectrogram view';
+    if (pill) pill.textContent = 'Still';
     caption.textContent = 'Spectrogram: time and frequency are shown together, with color indicating strength. Download IQ is the raw radio sample file for later demodulation/classification.';
   }
 }
