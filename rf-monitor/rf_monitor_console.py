@@ -1347,7 +1347,7 @@ HTML = r"""<!doctype html>
     .radioWaves path:nth-child(2) { animation-delay:0.18s; }
     .radioWaves path:nth-child(3) { animation-delay:0.36s; }
     .activityText { font-size:15px; font-weight:700; color:var(--text); text-transform:uppercase; letter-spacing:0; }
-    @keyframes radioPulse { 0% { opacity:0.04; transform:translate(0,0) scale(0.94); } 38% { opacity:0.95; } 100% { opacity:0.08; transform:translate(7px,-7px) scale(1.08); } }
+    @keyframes radioPulse { 0% { opacity:0.04; transform:translate(0,0) scale(0.94); } 38% { opacity:0.95; } 100% { opacity:0.08; transform:translate(12px,-12px) scale(1.08); } }
     @media (max-width: 1000px) { main { grid-template-columns: 1fr; } aside { border-left:0; border-top:1px solid var(--line); } #heatmapWrap { height: 60vh; } }
   </style>
 </head>
@@ -1426,9 +1426,9 @@ HTML = r"""<!doctype html>
     <div class="radioLoader">
       <img class="loaderDish" src="/assets/rf-dish-antenna-loader.png" alt="" aria-hidden="true">
       <svg class="radioWaves" viewBox="0 0 132 132" aria-hidden="true">
-        <path d="M91 43 C101 36 109 35 118 40" />
-        <path d="M88 33 C104 22 119 23 130 34" />
-        <path d="M84 23 C108 5 132 10 148 28" />
+        <path d="M88 54 C99 45 104 35 103 24" />
+        <path d="M96 60 C113 45 121 29 120 12" />
+        <path d="M104 66 C128 45 140 23 138 0" />
       </svg>
     </div>
     <div id="activityText" class="activityText">Working</div>
