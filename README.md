@@ -179,8 +179,9 @@ Grafana and Home Assistant are both useful, but neither is ideal as the primary 
 This UI needs to be RF-native:
 
 - Dense frequency-vs-time heatmap
-- Click a hot block
-- Drill into adjacent bins
+- Hover a heatmap block to read frequency, time, and RSSI
+- Click a hot block to zoom into that frequency range
+- Use the selected-frequency panel to drill into adjacent bins
 - Show anomaly overlays/events
 - Eventually trigger IQ capture around a selected frequency
 
@@ -208,4 +209,3 @@ Later:
 - Voice vs digital heuristics
 - FT8 and other mode-specific detectors
 - Model-assisted RF signal identification
-

@@ -106,13 +106,19 @@ def heatmap(
     hours: float = Query(3, ge=0.1, le=24),
     freq_step_mhz: int = Query(5, ge=1, le=100),
     time_bucket: str = Query("1m", pattern=r"^\d+[smh]$"),
+    freq_min_hz: int | None = Query(None, ge=0),
+    freq_max_hz: int | None = Query(None, ge=0),
 ) -> JSONResponse:
     step_hz = freq_step_mhz * 1_000_000
     range_duration = flux_duration(hours, "h")
+    freq_filter = ""
+    if freq_min_hz is not None and freq_max_hz is not None and freq_max_hz > freq_min_hz:
+        freq_filter = f"\n  |> filter(fn: (r) => int(v: r.frequency_hz) >= {freq_min_hz} and int(v: r.frequency_hz) <= {freq_max_hz})"
     query = f'''
 from(bucket: "{INFLUX_BUCKET}")
   |> range(start: -{range_duration})
   |> filter(fn: (r) => r._measurement == "rf_sweep" and r._field == "rssi_db")
+  {freq_filter}
   |> aggregateWindow(every: {time_bucket}, fn: max, createEmpty: false)
   |> map(fn: (r) => ({{ r with freq_bin: string(v: int(v: r.frequency_hz) / {step_hz} * {step_hz}) }}))
   |> group(columns: ["_time", "freq_bin"])
@@ -142,6 +148,8 @@ from(bucket: "{INFLUX_BUCKET}")
             "min": min_v,
             "max": max_v,
             "points": len(rows),
+            "freq_min_hz": freq_min_hz,
+            "freq_max_hz": freq_max_hz,
         }
     )
 
@@ -248,6 +256,8 @@ HTML = r"""<!doctype html>
     .item:hover { border-color:var(--accent); }
     .item b { color:var(--hot); }
     .muted { color:var(--muted); }
+    .readout { color: var(--accent); font-weight: 600; min-width: 300px; }
+    #zoomState { color: var(--hot); }
     #detailCanvas { height:220px; margin-top:10px; }
     @media (max-width: 1000px) { main { grid-template-columns: 1fr; } aside { border-left:0; border-top:1px solid var(--line); } #heatmapWrap { height: 60vh; } }
   </style>
@@ -263,7 +273,10 @@ HTML = r"""<!doctype html>
       <label>Range <select id="hours"><option>1</option><option selected>3</option><option>6</option><option>12</option><option>24</option></select> h</label>
       <label>Frequency bin <select id="freqStep"><option>1</option><option selected>5</option><option>10</option><option>25</option><option>50</option></select> MHz</label>
       <button id="refresh">Refresh</button>
+      <button id="resetZoom">Reset Zoom</button>
       <span class="muted" id="legend">Color = RSSI strength</span>
+      <span id="hoverReadout" class="readout"></span>
+      <span id="zoomState"></span>
     </div>
     <div id="heatmapWrap" class="panel"><canvas id="heatmap"></canvas></div>
   </section>
@@ -286,6 +299,9 @@ HTML = r"""<!doctype html>
 const heat = document.getElementById('heatmap');
 const detail = document.getElementById('detailCanvas');
 let heatData = null;
+let hoverCell = null;
+let zoomMinHz = null;
+let zoomMaxHz = null;
 
 function color(v, min, max) {
   if (v === null || Number.isNaN(v)) return '#11181d';
@@ -329,6 +345,11 @@ function drawHeatmap() {
   ctx.fillText(`${heatData.frequencies_mhz[rows-1] ?? ''} MHz`, 8, top+12);
   ctx.fillText(new Date(heatData.times[0] || Date.now()).toLocaleTimeString(), left, height-8);
   ctx.fillText(new Date(heatData.times[cols-1] || Date.now()).toLocaleTimeString(), Math.max(left, width-120), height-8);
+  if (hoverCell) {
+    ctx.strokeStyle = '#63d2ff';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(left + hoverCell.col*cellW, top + (rows-1-hoverCell.row)*cellH, Math.max(1, cellW), Math.max(1, cellH));
+  }
 }
 
 function heatCell(event) {
@@ -346,6 +367,23 @@ function heatCell(event) {
   const row = rows - 1 - rowInv;
   if (row < 0 || row >= rows || col < 0 || col >= cols) return null;
   return {row, col, freq: heatData.frequencies_hz[row], time: heatData.times[col], value: heatData.values[row][col]};
+}
+
+function zoomAround(freq) {
+  const step = Number(document.getElementById('freqStep').value) * 1_000_000;
+  const visibleSpan = Math.max(50_000_000, step * 24);
+  zoomMinHz = Math.max(0, Math.floor((freq - visibleSpan / 2) / step) * step);
+  zoomMaxHz = Math.ceil((freq + visibleSpan / 2) / step) * step;
+  document.getElementById('zoomState').textContent = `Zoom ${(zoomMinHz/1e6).toFixed(0)}-${(zoomMaxHz/1e6).toFixed(0)} MHz`;
+}
+
+function resetZoom() {
+  zoomMinHz = null;
+  zoomMaxHz = null;
+  hoverCell = null;
+  document.getElementById('zoomState').textContent = '';
+  document.getElementById('hoverReadout').textContent = '';
+  load();
 }
 
 async function selectFrequency(freq) {
@@ -379,7 +417,8 @@ async function load() {
   document.getElementById('statusText').textContent = 'Loading heatmap';
   const hours = document.getElementById('hours').value;
   const step = document.getElementById('freqStep').value;
-  heatData = await fetch(`/api/heatmap?hours=${hours}&freq_step_mhz=${step}`).then(r=>r.json());
+  const zoomParams = zoomMinHz !== null && zoomMaxHz !== null ? `&freq_min_hz=${zoomMinHz}&freq_max_hz=${zoomMaxHz}` : '';
+  heatData = await fetch(`/api/heatmap?hours=${hours}&freq_step_mhz=${step}${zoomParams}`).then(r=>r.json());
   document.getElementById('sweeps').textContent = heatData.points ?? 0;
   document.getElementById('maxRssi').textContent = heatData.max == null ? '--' : `${heatData.max.toFixed(1)} dB`;
   drawHeatmap();
@@ -398,12 +437,33 @@ async function load() {
 
 heat.addEventListener('click', e => {
   const cell = heatCell(e);
-  if (cell) selectFrequency(cell.freq);
+  if (cell) {
+    zoomAround(cell.freq);
+    selectFrequency(cell.freq);
+    load();
+  }
+});
+heat.addEventListener('mousemove', e => {
+  hoverCell = heatCell(e);
+  if (!hoverCell) {
+    document.getElementById('hoverReadout').textContent = '';
+    drawHeatmap();
+    return;
+  }
+  const rssi = hoverCell.value === null ? 'no data' : `${hoverCell.value.toFixed(1)} dB`;
+  document.getElementById('hoverReadout').textContent = `${(hoverCell.freq/1e6).toFixed(3)} MHz · ${rssi} · ${new Date(hoverCell.time).toLocaleTimeString()}`;
+  drawHeatmap();
+});
+heat.addEventListener('mouseleave', () => {
+  hoverCell = null;
+  document.getElementById('hoverReadout').textContent = '';
+  drawHeatmap();
 });
 window.addEventListener('resize', () => { drawHeatmap(); if (heatData) drawHeatmap(); });
 document.getElementById('refresh').addEventListener('click', load);
+document.getElementById('resetZoom').addEventListener('click', resetZoom);
 document.getElementById('hours').addEventListener('change', load);
-document.getElementById('freqStep').addEventListener('change', load);
+document.getElementById('freqStep').addEventListener('change', () => { resetZoom(); });
 load();
 setInterval(load, 60000);
 </script>
