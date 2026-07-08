@@ -26,6 +26,9 @@ flowchart LR
     Detector --> Influx
     Detector --> Status["status.json"]
     Status --> HAPub["HA MQTT publisher"]
+    USB["USB/sysfs + services"] --> RadioHealth["Radio Device Health<br/>per-minute poll"]
+    RadioHealth --> Console
+    RadioHealth --> HAPub
     HAPub --> HA["Home Assistant<br/>RF Monitor sidebar dashboard"]
 ```
 
@@ -179,6 +182,7 @@ The HA dashboard includes:
 - Link to the RF console
 - RF monitor status entities
 - Embedded iframe of the RF console
+- Native Home Assistant `Radio Health` view under the RF Monitor dashboard, plus a Radio Health tab in the RF console, with poll history and per-device status for HackRF, SDRplay, and RTL-SDR devices
 
 MQTT status entities currently include:
 

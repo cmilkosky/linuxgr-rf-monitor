@@ -1,0 +1,12 @@
+[Unit]
+Description=Publish LinuxGR radio device health to Home Assistant
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=cmilkosk
+WorkingDirectory=/home/cmilkosk/rf-monitor
+Environment=HASS_ENV=/home/cmilkosk/.config/cowrie/ha.env
+ExecStart=/usr/bin/python3 /home/cmilkosk/rf-monitor/radio_device_health.py
+

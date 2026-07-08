@@ -1,0 +1,11 @@
+[Unit]
+Description=Poll LinuxGR radio device health every minute
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=60
+AccuracySec=5
+Unit=radio-device-health.service
+
+[Install]
+WantedBy=timers.target

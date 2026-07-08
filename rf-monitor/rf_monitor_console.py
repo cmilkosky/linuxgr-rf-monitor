@@ -13,7 +13,7 @@ import statistics
 import threading
 import time
 import wave
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +25,8 @@ from rf_signal_intel import classify_signal, extract_iq_features
 
 CONFIG_PATH = Path(os.environ.get("RF_MONITOR_ENV", "/home/cmilkosk/.config/hackrf-influx.env"))
 STATUS_PATH = Path(os.environ.get("RF_MONITOR_STATUS", "/home/cmilkosk/rf-monitor/status.json"))
+RADIO_HEALTH_STATUS_PATH = Path(os.environ.get("RADIO_HEALTH_STATUS", "/home/cmilkosk/rf-monitor/radio-health.json"))
+RADIO_HEALTH_HISTORY_PATH = Path(os.environ.get("RADIO_HEALTH_HISTORY", "/home/cmilkosk/rf-monitor/radio-health-history.jsonl"))
 CAPTURE_DIR = Path(os.environ.get("RF_CAPTURE_DIR", "/home/cmilkosk/rf-monitor/captures"))
 DEEP_SCAN_DIR = Path(os.environ.get("RF_DEEP_SCAN_DIR", "/home/cmilkosk/rf-monitor/deep-scans"))
 ASSET_DIR = Path(os.environ.get("RF_ASSET_DIR", "/home/cmilkosk/rf-monitor/assets"))
@@ -89,6 +91,33 @@ def read_status() -> dict[str, Any]:
         "anomalies_active": 0,
         "latest_anomalies": [],
     }
+
+
+def read_radio_health() -> dict[str, Any]:
+    if RADIO_HEALTH_STATUS_PATH.exists():
+        try:
+            return json.loads(RADIO_HEALTH_STATUS_PATH.read_text())
+        except json.JSONDecodeError:
+            pass
+    return {
+        "status": "unknown",
+        "updated_at": None,
+        "score": 0,
+        "poll_ok": False,
+        "expected_count": 0,
+        "present_count": 0,
+        "healthy_count": 0,
+        "missing_count": 0,
+        "degraded_count": 0,
+        "devices": [],
+    }
+
+
+def parse_iso_datetime(value: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def flux_duration(value: float, unit: str) -> str:
@@ -303,6 +332,316 @@ def animation_viewer_html(title: str, animation_url: str, still_url: str) -> str
       toggle.textContent = playing ? 'Pause' : 'Play';
       state.textContent = playing ? 'Playing' : 'Paused';
     }});
+  </script>
+</body>
+</html>"""
+
+
+RADIO_HEALTH_PANEL_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LinuxGR Radio Health</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --page:#f7f9fb;
+      --ink:#111827;
+      --muted:#5f6b78;
+      --line:#d7dde3;
+      --heat-bg:#132031;
+      --heat-grid:#0b1724;
+      --ok:#4fc58b;
+      --impaired:#f3c247;
+      --offline:#e53935;
+      --unknown:#162332;
+      --port-bg:#ffffff;
+    }
+    * { box-sizing:border-box; }
+    body {
+      margin:0;
+      background:var(--page);
+      color:var(--ink);
+      font-family:Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+    }
+    main {
+      width:min(980px, 100%);
+      margin:0 auto;
+      padding:14px;
+      display:grid;
+      grid-template-columns:minmax(0, 1fr);
+      gap:14px;
+    }
+    .heatCard {
+      background:var(--heat-bg);
+      border-radius:16px;
+      border:8px solid #132031;
+      padding:8px 10px 10px;
+      color:#d7e3ef;
+      box-shadow:0 1px 2px rgba(17,24,39,0.18);
+    }
+    .heatTitle {
+      height:22px;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      font-size:15px;
+      font-weight:700;
+      line-height:1;
+    }
+    #pollHeatmap {
+      display:block;
+      width:100%;
+      height:330px;
+      background:#132031;
+    }
+    .switchCard {
+      background:var(--port-bg);
+      border:1px solid var(--line);
+      padding:16px;
+      box-shadow:0 1px 2px rgba(17,24,39,0.08);
+    }
+    h1 {
+      margin:0 0 14px;
+      font-size:22px;
+      line-height:1.15;
+      font-weight:500;
+    }
+    .portGrid {
+      display:grid;
+      grid-template-columns:repeat(3, minmax(124px, 1fr));
+      width:min(520px, 100%);
+      border-top:1px solid var(--line);
+      border-left:1px solid var(--line);
+      background:#fff;
+    }
+    .portCell {
+      min-height:66px;
+      border-right:1px solid var(--line);
+      border-bottom:1px solid var(--line);
+      padding:8px 9px;
+      display:flex;
+      flex-direction:column;
+      justify-content:flex-start;
+      gap:8px;
+    }
+    .portName {
+      font-size:14px;
+      font-weight:700;
+      line-height:1.12;
+      min-height:31px;
+    }
+    .statusBox {
+      width:18px;
+      height:18px;
+      border:1px solid rgba(0,0,0,0.28);
+      box-shadow:inset 0 1px 0 rgba(255,255,255,0.35);
+    }
+    .ok { background:linear-gradient(#19d23c, #0a981f); }
+    .impaired { background:linear-gradient(#ffe27c, #d69d00); }
+    .offline { background:linear-gradient(#ff5d55, #bb1515); }
+    .unknown { background:linear-gradient(#41566a, #1f2d3c); }
+    .legend {
+      display:flex;
+      flex-wrap:wrap;
+      align-items:center;
+      gap:9px;
+      margin-top:14px;
+      font-size:14px;
+    }
+    .legend b { margin-right:-4px; }
+    .legendItem {
+      display:inline-flex;
+      align-items:center;
+      gap:4px;
+      white-space:nowrap;
+    }
+    .miniBox {
+      width:17px;
+      height:17px;
+      border:1px solid rgba(0,0,0,0.28);
+    }
+    .summary {
+      margin-top:12px;
+      color:var(--muted);
+      font-size:13px;
+      line-height:1.35;
+    }
+    @media (max-width:560px) {
+      main { padding:10px; gap:10px; }
+      .heatCard { border-width:6px; border-radius:14px; padding:6px; }
+      #pollHeatmap { height:210px; }
+      .heatTitle { height:18px; font-size:14px; }
+      .switchCard { padding:10px; }
+      h1 { font-size:19px; margin-bottom:10px; }
+      .portGrid { grid-template-columns:repeat(2, minmax(120px, 1fr)); }
+      .portCell { min-height:52px; padding:6px; gap:5px; }
+      .portName { font-size:12px; min-height:24px; }
+      .statusBox, .miniBox { width:16px; height:16px; }
+      .legend { margin-top:10px; font-size:12px; gap:7px; }
+      .summary { margin-top:8px; font-size:12px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="heatCard" aria-label="Radio poll health heatmap">
+      <div class="heatTitle">Poll Health</div>
+      <canvas id="pollHeatmap"></canvas>
+    </section>
+    <section class="switchCard" aria-label="Radio device health status">
+      <h1>LinuxGR Radio Status</h1>
+      <div id="radioGrid" class="portGrid"></div>
+      <div class="legend">
+        <b>Legend:</b>
+        <span class="legendItem"><span class="miniBox ok"></span>OK</span>
+        <span class="legendItem"><span class="miniBox impaired"></span>Impaired</span>
+        <span class="legendItem"><span class="miniBox offline"></span>Offline</span>
+      </div>
+      <div id="summary" class="summary">Loading radio health...</div>
+    </section>
+  </main>
+  <script>
+    const DEVICE_LABELS = {
+      sdrplay: 'SDRplay',
+      hackrf: 'hackRF One',
+      rtl0: 'RTL-SDR RTL0',
+      rtl2: 'RTL-SDR RTL2',
+      rtl3: 'RTL-SDR RTL3'
+    };
+    const DEVICE_ORDER = ['sdrplay', 'hackrf', 'rtl0', 'rtl2', 'rtl3'];
+    const COLORS = {
+      ok: '#4fc58b',
+      degraded: '#f3c247',
+      missing: '#e53935',
+      unknown: '#162332',
+      none: '#132031'
+    };
+
+    function cssClass(status) {
+      if (status === 'ok') return 'ok';
+      if (status === 'degraded') return 'impaired';
+      if (status === 'missing') return 'offline';
+      return 'unknown';
+    }
+
+    function statusColor(status) {
+      return COLORS[status] || COLORS.unknown;
+    }
+
+    function resizeCanvas(canvas) {
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.max(1, Math.floor(rect.width * dpr));
+      canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+      const ctx = canvas.getContext('2d');
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      return {ctx, width: rect.width, height: rect.height};
+    }
+
+    function drawHeatmap(history) {
+      const canvas = document.getElementById('pollHeatmap');
+      const {ctx, width, height} = resizeCanvas(canvas);
+      ctx.clearRect(0, 0, width, height);
+      const left = 31;
+      const right = 4;
+      const top = 18;
+      const bottom = 4;
+      const plotW = width - left - right;
+      const plotH = height - top - bottom;
+      const cols = 24;
+      const rows = 60;
+      const cellW = plotW / cols;
+      const cellH = plotH / rows;
+      const dayStart = new Date();
+      dayStart.setHours(0, 0, 0, 0);
+      const dayEnd = new Date(dayStart.getTime() + 24 * 3600_000);
+      const slots = new Map();
+      (history || []).forEach(record => {
+        const dt = new Date(record.updated_at);
+        if (Number.isNaN(dt.getTime()) || dt < dayStart || dt >= dayEnd) return;
+        slots.set(`${dt.getHours()}:${dt.getMinutes()}`, record.status || 'unknown');
+      });
+
+      ctx.fillStyle = '#132031';
+      ctx.fillRect(0, 0, width, height);
+      for (let hour = 0; hour < cols; hour++) {
+        for (let minute = 0; minute < rows; minute++) {
+          const status = slots.get(`${hour}:${minute}`);
+          ctx.fillStyle = status ? statusColor(status) : COLORS.none;
+          ctx.fillRect(
+            left + hour * cellW + 1,
+            top + minute * cellH + 1,
+            Math.max(1, cellW - 2),
+            Math.max(1, cellH - 2)
+          );
+        }
+      }
+
+      ctx.strokeStyle = '#0b1724';
+      ctx.lineWidth = 1;
+      for (let hour = 0; hour <= cols; hour++) {
+        const x = left + hour * cellW;
+        ctx.beginPath();
+        ctx.moveTo(x, top);
+        ctx.lineTo(x, top + plotH);
+        ctx.stroke();
+      }
+      for (let minute = 0; minute <= rows; minute += 10) {
+        const y = top + minute * cellH;
+        ctx.beginPath();
+        ctx.moveTo(left, y);
+        ctx.lineTo(left + plotW, y);
+        ctx.stroke();
+      }
+
+      ctx.fillStyle = '#d7e3ef';
+      ctx.font = '10px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      [0, 4, 8, 12, 16, 20].forEach(hour => {
+        ctx.fillText(String(hour).padStart(2, '0'), left + hour * cellW + cellW / 2, 9);
+      });
+      ctx.textAlign = 'right';
+      [0, 10, 20, 30, 40, 50].forEach(minute => {
+        ctx.fillText(String(minute), left - 6, top + minute * cellH + 4);
+      });
+    }
+
+    function renderRadios(status) {
+      const byId = new Map((status.devices || []).map(device => [device.id, device]));
+      const ordered = DEVICE_ORDER.map(id => byId.get(id)).filter(Boolean);
+      const extras = (status.devices || []).filter(device => !DEVICE_ORDER.includes(device.id));
+      const devices = ordered.concat(extras);
+      document.getElementById('radioGrid').innerHTML = devices.map(device => {
+        const label = DEVICE_LABELS[device.id] || device.name || device.id;
+        const cls = cssClass(device.status);
+        return `<div class="portCell">
+          <div class="portName">${label}</div>
+          <span class="statusBox ${cls}" title="${device.status || 'unknown'}"></span>
+        </div>`;
+      }).join('');
+      const updated = status.updated_at ? new Date(status.updated_at).toLocaleString() : 'never';
+      document.getElementById('summary').textContent =
+        `${status.healthy_count || 0}/${status.expected_count || 0} radios OK. ` +
+        `${status.degraded_count || 0} impaired, ${status.missing_count || 0} offline. Last poll ${updated}.`;
+    }
+
+    async function refresh() {
+      const [status, history] = await Promise.all([
+        fetch('/api/radio-health', {cache: 'no-store'}).then(response => response.json()),
+        fetch('/api/radio-health/history?hours=24', {cache: 'no-store'}).then(response => response.json())
+      ]);
+      drawHeatmap(history.items || []);
+      renderRadios(status);
+    }
+
+    refresh().catch(() => {
+      drawHeatmap([]);
+      document.getElementById('summary').textContent = 'Radio health feed unavailable.';
+    });
+    setInterval(refresh, 60000);
+    window.addEventListener('resize', () => refresh().catch(() => drawHeatmap([])));
   </script>
 </body>
 </html>"""
@@ -913,6 +1252,11 @@ def index() -> str:
     return HTML
 
 
+@app.get("/ha-radio-health", response_class=HTMLResponse)
+def ha_radio_health() -> str:
+    return RADIO_HEALTH_PANEL_HTML
+
+
 @app.get("/api/status")
 def status() -> JSONResponse:
     status_doc = read_status()
@@ -923,7 +1267,30 @@ def status() -> JSONResponse:
 @app.get("/api/health")
 def health() -> JSONResponse:
     influx = requests.get(f"{INFLUX_URL}/health", timeout=5).json()
-    return JSONResponse({"ok": influx.get("status") == "pass", "influx": influx, "status": read_status()})
+    return JSONResponse({"ok": influx.get("status") == "pass", "influx": influx, "status": read_status(), "radio_health": read_radio_health()})
+
+
+@app.get("/api/radio-health")
+def radio_health() -> JSONResponse:
+    status_doc = read_radio_health()
+    status_doc["console_time"] = datetime.now(timezone.utc).isoformat()
+    return JSONResponse(status_doc)
+
+
+@app.get("/api/radio-health/history")
+def radio_health_history(hours: float = Query(24, ge=0.1, le=168)) -> JSONResponse:
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    records: list[dict[str, Any]] = []
+    if RADIO_HEALTH_HISTORY_PATH.exists():
+        for line in RADIO_HEALTH_HISTORY_PATH.read_text().splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ts = parse_iso_datetime(str(record.get("updated_at", "")))
+            if ts and ts >= cutoff:
+                records.append(record)
+    return JSONResponse({"items": records, "hours": hours, "status": read_radio_health()})
 
 
 @app.get("/assets/{asset_name}")
@@ -1280,17 +1647,24 @@ HTML = r"""<!doctype html>
     body { margin: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; background: var(--bg); color: var(--text); }
     header { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:10px 22px; border-bottom:1px solid var(--line); background:#12181d; position:sticky; top:0; z-index:3; }
     h1 { margin:0; font-size:20px; font-weight:650; }
+    .headerLeft { display:flex; align-items:center; gap:18px; min-width:0; }
     .brand { display:flex; align-items:center; gap:11px; border:0; background:transparent; color:var(--text); padding:3px 0; border-radius:8px; cursor:pointer; }
     .brand:hover { color:var(--hot); }
     .brandMark { width:58px; height:58px; flex:0 0 58px; border:1px solid #35424c; border-radius:8px; background:#10161a; object-fit:cover; object-position:center; box-shadow:0 0 0 1px rgba(0,0,0,0.18) inset; }
     .brand:hover .brandMark { border-color:var(--hot); }
+    .tabs { display:flex; align-items:center; gap:6px; }
+    .tabBtn { padding:7px 10px; font-size:13px; background:#172027; }
+    .tabBtn.active { color:var(--hot); border-color:#77613c; background:#20231f; }
     main { display:grid; grid-template-columns: 1fr 360px; min-height: calc(100vh - 64px); }
+    .view { display:none; }
+    .view.active { display:grid; }
     section { padding:16px; }
     aside { border-left:1px solid var(--line); background:#12181d; padding:16px; overflow:auto; }
     .toolbar { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:12px; }
     .toolbarGroup { display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:6px 8px; border:1px solid var(--line); border-radius:8px; background:#141b20; }
     .selectedChip { color:var(--hot); font-weight:700; min-width:94px; }
-    select, button { background:#202a31; color:var(--text); border:1px solid #35424c; border-radius:6px; padding:7px 10px; font:inherit; }
+    select, button, input { background:#202a31; color:var(--text); border:1px solid #35424c; border-radius:6px; padding:7px 10px; font:inherit; }
+    input[type="number"] { width:92px; }
     button { cursor:pointer; }
     button:hover { border-color:var(--accent); }
     button:disabled { opacity:0.55; cursor:not-allowed; }
@@ -1347,23 +1721,51 @@ HTML = r"""<!doctype html>
     .radioWaves path:nth-child(2) { animation-delay:0.18s; }
     .radioWaves path:nth-child(3) { animation-delay:0.36s; }
     .activityText { font-size:15px; font-weight:700; color:var(--text); text-transform:uppercase; letter-spacing:0; }
+    .radioHealthView section { min-width:0; }
+    .healthLayout { display:grid; grid-template-columns:minmax(460px, 1.1fr) minmax(360px, .9fr); gap:14px; align-items:start; }
+    .healthPanel { padding:12px; }
+    .healthPanel h3 { margin:0 0 8px; font-size:16px; }
+    .healthPanelHead { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:8px; }
+    #radioPollCanvas { height:360px; min-height:360px; }
+    .deviceGrid { display:grid; grid-template-columns:repeat(3, minmax(120px, 1fr)); gap:8px; }
+    .deviceTile { border:1px solid var(--line); background:#141b20; border-radius:8px; padding:10px; min-height:94px; }
+    .deviceTile b { display:block; font-size:14px; margin-bottom:6px; }
+    .statusSwatch { width:18px; height:18px; border-radius:3px; border:1px solid rgba(255,255,255,0.28); display:inline-block; vertical-align:middle; margin-right:7px; background:#0b0f12; }
+    .statusOk { background:#22b63b; }
+    .statusDegraded { background:#f3c247; }
+    .statusMissing { background:#e53935; }
+    .statusUnknown { background:#35424c; }
+    .healthSummary { display:grid; grid-template-columns:repeat(2, 1fr); gap:8px; margin-bottom:12px; }
+    .healthLegend { display:flex; flex-wrap:wrap; gap:10px; align-items:center; color:var(--muted); font-size:12px; margin-top:10px; }
+    .radioIssues { display:flex; flex-direction:column; gap:8px; }
     @keyframes radioPulse { 0% { opacity:0.04; transform:translate(0,0) scale(0.94); } 38% { opacity:0.95; } 100% { opacity:0.08; transform:translate(12px,-12px) scale(1.08); } }
-    @media (max-width: 1000px) { main { grid-template-columns: 1fr; } aside { border-left:0; border-top:1px solid var(--line); } #heatmapWrap { height: 60vh; } }
+    @media (max-width: 1000px) { main, .view.active { grid-template-columns: 1fr; } aside { border-left:0; border-top:1px solid var(--line); } #heatmapWrap { height: 60vh; } .healthLayout { grid-template-columns:1fr; } .deviceGrid { grid-template-columns:repeat(2, minmax(120px, 1fr)); } .headerLeft { flex-wrap:wrap; } }
   </style>
 </head>
 <body>
 <header>
-  <button id="homeBrand" class="brand" title="Reset RF Monitor home view" aria-label="Reset RF Monitor home view">
-    <img class="brandMark" src="/assets/rf-dish-antenna.png" alt="" aria-hidden="true">
-    <h1>RF Monitor</h1>
-  </button>
+  <div class="headerLeft">
+    <button id="homeBrand" class="brand" title="Reset RF Monitor home view" aria-label="Reset RF Monitor home view">
+      <img class="brandMark" src="/assets/rf-dish-antenna.png" alt="" aria-hidden="true">
+      <h1>RF Monitor</h1>
+    </button>
+    <nav class="tabs" aria-label="RF Monitor views">
+      <button id="spectrumTab" class="tabBtn active" data-view="spectrumView">Spectrum</button>
+      <button id="radioHealthTab" class="tabBtn" data-view="radioHealthView">Radio Health</button>
+    </nav>
+  </div>
   <div class="muted" id="statusText">Loading</div>
 </header>
-<main>
+<main id="spectrumView" class="view active">
   <section>
     <div class="toolbar">
       <label>Range <select id="hours"><option selected>1</option><option>3</option><option>6</option><option>12</option><option>24</option></select> h</label>
       <label>Frequency bin <select id="freqStep"><option>1</option><option selected>5</option><option>10</option><option>25</option><option>50</option></select> MHz</label>
+      <div class="toolbarGroup">
+        <label>View <input id="freqMinMhz" type="number" min="0" max="6000" step="0.001" placeholder="Start"> MHz</label>
+        <label>to <input id="freqMaxMhz" type="number" min="0" max="6000" step="0.001" placeholder="End"> MHz</label>
+        <button id="applyFreqRange">Apply Range</button>
+      </div>
       <button id="refresh">Refresh</button>
       <button id="resetZoom">Reset Zoom</button>
       <div class="toolbarGroup">
@@ -1421,6 +1823,58 @@ HTML = r"""<!doctype html>
     <div id="top" class="list"></div>
   </aside>
 </main>
+<main id="radioHealthView" class="view radioHealthView">
+  <section>
+    <div class="toolbar">
+      <button id="radioHealthRefresh">Refresh</button>
+      <label>History <select id="radioHealthHours"><option>6</option><option selected>24</option><option>48</option><option>72</option><option>168</option></select> h</label>
+      <span class="muted" id="radioHealthUpdated">Radio health loading</span>
+    </div>
+    <div class="healthLayout">
+      <div class="panel healthPanel">
+        <div class="healthPanelHead">
+          <div>
+            <h3>Poll Health</h3>
+            <div class="hint">One square per minute. Columns are hours; rows are minutes within the hour.</div>
+          </div>
+          <span class="muted" id="radioPollCount">-- polls</span>
+        </div>
+        <canvas id="radioPollCanvas"></canvas>
+        <div class="healthLegend">
+          <span><span class="statusSwatch statusOk"></span>OK</span>
+          <span><span class="statusSwatch statusDegraded"></span>degraded</span>
+          <span><span class="statusSwatch statusMissing"></span>missing</span>
+          <span><span class="statusSwatch statusUnknown"></span>no poll</span>
+        </div>
+      </div>
+      <div class="panel healthPanel">
+        <div class="healthPanelHead">
+          <div>
+            <h3>SDR Devices</h3>
+            <div class="hint">Current status for attached linuxGR radio devices.</div>
+          </div>
+          <strong id="radioHealthScore">--%</strong>
+        </div>
+        <div id="radioDeviceGrid" class="deviceGrid"></div>
+        <div class="healthLegend">
+          <span><span class="statusSwatch statusOk"></span>healthy</span>
+          <span><span class="statusSwatch statusDegraded"></span>service issue</span>
+          <span><span class="statusSwatch statusMissing"></span>disconnected</span>
+        </div>
+      </div>
+    </div>
+  </section>
+  <aside>
+    <div class="healthSummary">
+      <div class="stat"><strong id="radioPresent">--</strong><span>present</span></div>
+      <div class="stat"><strong id="radioMissing">--</strong><span>missing</span></div>
+      <div class="stat"><strong id="radioHealthy">--</strong><span>healthy</span></div>
+      <div class="stat"><strong id="radioStatus">--</strong><span>overall</span></div>
+    </div>
+    <h3>Details</h3>
+    <div id="radioHealthDetails" class="radioIssues"></div>
+  </aside>
+</main>
 <div id="activityOverlay" aria-live="polite" aria-hidden="true">
   <div class="activityBadge">
     <div class="radioLoader">
@@ -1438,7 +1892,10 @@ HTML = r"""<!doctype html>
 const heat = document.getElementById('heatmap');
 const detail = document.getElementById('detailCanvas');
 const deepCanvas = document.getElementById('deepScanCanvas');
+const radioPollCanvas = document.getElementById('radioPollCanvas');
 let heatData = null;
+let radioHealthData = null;
+let radioHealthHistory = [];
 let hoverCell = null;
 let hoverFreqHz = null;
 let zoomMinHz = null;
@@ -1448,6 +1905,16 @@ let captureRunning = false;
 let deepScanRunning = false;
 let deepScanData = null;
 let activityTokens = new Set();
+
+function setActiveView(viewId) {
+  document.querySelectorAll('.view').forEach(view => view.classList.toggle('active', view.id === viewId));
+  document.querySelectorAll('.tabBtn').forEach(btn => btn.classList.toggle('active', btn.dataset.view === viewId));
+  if (viewId === 'radioHealthView') {
+    loadRadioHealth();
+  } else {
+    drawHeatmap();
+  }
+}
 
 function showActivity(label) {
   const token = Symbol(label);
@@ -1520,6 +1987,124 @@ function resizeCanvas(canvas) {
   const ctx = canvas.getContext('2d');
   ctx.setTransform(dpr,0,0,dpr,0,0);
   return {ctx, width: rect.width, height: rect.height};
+}
+
+function healthStatusClass(status) {
+  if (status === 'ok') return 'statusOk';
+  if (status === 'degraded') return 'statusDegraded';
+  if (status === 'missing') return 'statusMissing';
+  return 'statusUnknown';
+}
+
+function healthColor(status) {
+  if (status === 'ok') return '#54c28a';
+  if (status === 'degraded') return '#f3c247';
+  if (status === 'missing') return '#e53935';
+  return '#24313a';
+}
+
+function drawRadioPoll(history, hours) {
+  const {ctx, width, height} = resizeCanvas(radioPollCanvas);
+  ctx.clearRect(0,0,width,height);
+  const left = 44;
+  const top = 28;
+  const right = 8;
+  const bottom = 26;
+  const cols = Math.max(1, Math.min(168, Number(hours) || 24));
+  const rows = 60;
+  const plotW = width - left - right;
+  const plotH = height - top - bottom;
+  const cellW = plotW / cols;
+  const cellH = plotH / rows;
+  const now = new Date();
+  now.setSeconds(0, 0);
+  const bySlot = new Map();
+  (history || []).forEach(record => {
+    const dt = new Date(record.updated_at);
+    if (Number.isNaN(dt.getTime())) return;
+    dt.setSeconds(0, 0);
+    bySlot.set(dt.toISOString().slice(0,16), record.status || 'unknown');
+  });
+  ctx.fillStyle = '#10161a';
+  ctx.fillRect(left, top, plotW, plotH);
+  for (let c = 0; c < cols; c++) {
+    const hourStart = new Date(now.getTime() - (cols - 1 - c) * 3600_000);
+    hourStart.setMinutes(0, 0, 0);
+    for (let m = 0; m < rows; m++) {
+      const slot = new Date(hourStart.getTime() + m * 60_000);
+      const key = slot.toISOString().slice(0,16);
+      const status = bySlot.get(key);
+      ctx.fillStyle = status ? healthColor(status) : '#233039';
+      ctx.fillRect(left + c * cellW + 1, top + m * cellH + 1, Math.max(1, cellW - 2), Math.max(1, cellH - 2));
+    }
+  }
+  ctx.strokeStyle = '#2b353d';
+  ctx.lineWidth = 1;
+  for (let c = 0; c <= cols; c++) {
+    const x = left + c * cellW;
+    ctx.beginPath();
+    ctx.moveTo(x, top);
+    ctx.lineTo(x, top + plotH);
+    ctx.stroke();
+  }
+  for (let m = 0; m <= rows; m += 10) {
+    const y = top + m * cellH;
+    ctx.beginPath();
+    ctx.moveTo(left, y);
+    ctx.lineTo(left + plotW, y);
+    ctx.stroke();
+  }
+  ctx.fillStyle = '#9caab5';
+  ctx.font = '12px system-ui';
+  [0,10,20,30,40,50].forEach(m => ctx.fillText(String(m), 10, top + m * cellH + 4));
+  const labelEvery = cols > 48 ? 12 : cols > 24 ? 6 : 4;
+  for (let c = 0; c < cols; c += labelEvery) {
+    const dt = new Date(now.getTime() - (cols - 1 - c) * 3600_000);
+    ctx.fillText(String(dt.getHours()).padStart(2, '0'), left + c * cellW + 2, 16);
+  }
+}
+
+function renderRadioHealth(status, history) {
+  radioHealthData = status;
+  radioHealthHistory = history || [];
+  document.getElementById('radioHealthUpdated').textContent = status.updated_at ? `Updated ${new Date(status.updated_at).toLocaleString()}` : 'No radio health poll yet';
+  document.getElementById('radioHealthScore').textContent = `${status.score ?? 0}%`;
+  document.getElementById('radioPresent').textContent = `${status.present_count ?? 0}/${status.expected_count ?? 0}`;
+  document.getElementById('radioMissing').textContent = status.missing_count ?? 0;
+  document.getElementById('radioHealthy').textContent = status.healthy_count ?? 0;
+  document.getElementById('radioStatus').textContent = status.status ?? 'unknown';
+  document.getElementById('radioPollCount').textContent = `${radioHealthHistory.length} polls`;
+  const devices = status.devices || [];
+  document.getElementById('radioDeviceGrid').innerHTML = devices.map(device => {
+    const usb = device.usb || {};
+    const detail = device.present
+      ? `${usb.serial || usb.sysfs || 'USB'}${device.service ? ` · ${device.service_state}` : ''}`
+      : `Expected ${device.expected_serial || `${device.kind} USB`}`;
+    return `<div class="deviceTile">
+      <b><span class="statusSwatch ${healthStatusClass(device.status)}"></span>${device.name}</b>
+      <div class="muted">${device.status}</div>
+      <div class="hint">${detail}</div>
+    </div>`;
+  }).join('') || '<div class="muted">No device status yet.</div>';
+  const issues = devices.filter(d => d.status !== 'ok');
+  document.getElementById('radioHealthDetails').innerHTML = issues.length
+    ? issues.map(device => `<div class="item"><b>${device.name}</b><br>${device.status}<br><span class="muted">${device.present ? `${device.service || 'USB'} ${device.service_state || ''}` : 'Not present on USB'}</span></div>`).join('')
+    : '<div class="muted">All expected radios are present and healthy.</div>';
+  drawRadioPoll(radioHealthHistory, document.getElementById('radioHealthHours').value);
+}
+
+async function loadRadioHealth() {
+  try {
+    const hours = document.getElementById('radioHealthHours').value;
+    const [status, history] = await Promise.all([
+      fetch('/api/radio-health').then(r => r.json()),
+      fetch(`/api/radio-health/history?hours=${hours}`).then(r => r.json())
+    ]);
+    renderRadioHealth(status, history.items || []);
+  } catch (err) {
+    document.getElementById('radioHealthUpdated').textContent = 'Radio health unavailable';
+    drawRadioPoll([], document.getElementById('radioHealthHours').value);
+  }
 }
 
 function heatGeometry(width, height) {
@@ -1660,7 +2245,54 @@ function zoomAround(freq) {
   const visibleSpan = Math.max(50_000_000, step * 24);
   zoomMinHz = Math.max(0, Math.floor((freq - visibleSpan / 2) / step) * step);
   zoomMaxHz = Math.ceil((freq + visibleSpan / 2) / step) * step;
-  document.getElementById('zoomState').textContent = `Zoom ${(zoomMinHz/1e6).toFixed(0)}-${(zoomMaxHz/1e6).toFixed(0)} MHz`;
+  setFrequencyRangeInputs(zoomMinHz, zoomMaxHz);
+  updateZoomState();
+}
+
+function formatMhzInput(freqHz) {
+  return Number((freqHz / 1e6).toFixed(6)).toString();
+}
+
+function setFrequencyRangeInputs(minHz, maxHz) {
+  document.getElementById('freqMinMhz').value = minHz === null ? '' : formatMhzInput(minHz);
+  document.getElementById('freqMaxMhz').value = maxHz === null ? '' : formatMhzInput(maxHz);
+}
+
+function updateZoomState() {
+  const el = document.getElementById('zoomState');
+  if (zoomMinHz === null || zoomMaxHz === null) {
+    el.textContent = '';
+    return;
+  }
+  el.textContent = `Viewing ${(zoomMinHz/1e6).toFixed(3)}-${(zoomMaxHz/1e6).toFixed(3)} MHz`;
+}
+
+function applyManualFrequencyRange() {
+  const minInput = document.getElementById('freqMinMhz');
+  const maxInput = document.getElementById('freqMaxMhz');
+  const minRaw = minInput.value.trim();
+  const maxRaw = maxInput.value.trim();
+  if (!minRaw && !maxRaw) {
+    resetZoom();
+    return;
+  }
+  const minMhz = Number(minRaw);
+  const maxMhz = Number(maxRaw);
+  if (!Number.isFinite(minMhz) || !Number.isFinite(maxMhz) || minMhz === maxMhz) {
+    document.getElementById('statusText').textContent = 'Enter a valid start and end frequency in MHz';
+    return;
+  }
+  const lowMhz = Math.max(0, Math.min(minMhz, maxMhz));
+  const highMhz = Math.min(6000, Math.max(minMhz, maxMhz));
+  if (highMhz <= lowMhz) {
+    document.getElementById('statusText').textContent = 'Frequency range must be within 0-6000 MHz';
+    return;
+  }
+  zoomMinHz = Math.round(lowMhz * 1_000_000);
+  zoomMaxHz = Math.round(highMhz * 1_000_000);
+  setFrequencyRangeInputs(zoomMinHz, zoomMaxHz);
+  updateZoomState();
+  load(false, 'Applying Range');
 }
 
 function resetZoom() {
@@ -1668,7 +2300,8 @@ function resetZoom() {
   zoomMaxHz = null;
   hoverCell = null;
   hoverFreqHz = null;
-  document.getElementById('zoomState').textContent = '';
+  setFrequencyRangeInputs(null, null);
+  updateZoomState();
   document.getElementById('hoverReadout').textContent = '';
   load(false, 'Resetting View');
 }
@@ -1679,7 +2312,8 @@ function resetHomeView() {
   hoverCell = null;
   hoverFreqHz = null;
   selectedFreqHz = null;
-  document.getElementById('zoomState').textContent = '';
+  setFrequencyRangeInputs(null, null);
+  updateZoomState();
   document.getElementById('hoverReadout').textContent = '';
   document.getElementById('toolbarSelected').textContent = 'No selection';
   document.getElementById('selected').innerHTML = 'Click a heatmap block.';
@@ -2116,20 +2750,28 @@ heat.addEventListener('mouseleave', () => {
   document.getElementById('hoverReadout').textContent = '';
   drawHeatmap();
 });
-window.addEventListener('resize', () => { drawHeatmap(); drawDeepScan(); });
+window.addEventListener('resize', () => { drawHeatmap(); drawDeepScan(); drawRadioPoll(radioHealthHistory, document.getElementById('radioHealthHours').value); });
 document.getElementById('refresh').addEventListener('click', () => load(false, 'Refreshing'));
 document.getElementById('resetZoom').addEventListener('click', resetZoom);
+document.getElementById('applyFreqRange').addEventListener('click', applyManualFrequencyRange);
+document.getElementById('freqMinMhz').addEventListener('keydown', e => { if (e.key === 'Enter') applyManualFrequencyRange(); });
+document.getElementById('freqMaxMhz').addEventListener('keydown', e => { if (e.key === 'Enter') applyManualFrequencyRange(); });
 document.getElementById('homeBrand').addEventListener('click', resetHomeView);
+document.querySelectorAll('.tabBtn').forEach(btn => btn.addEventListener('click', () => setActiveView(btn.dataset.view)));
+document.getElementById('radioHealthRefresh').addEventListener('click', loadRadioHealth);
+document.getElementById('radioHealthHours').addEventListener('change', loadRadioHealth);
 document.getElementById('captureBtn').addEventListener('click', captureSelected);
 document.getElementById('deepScanBtn').addEventListener('click', () => runFocusedScan());
 document.getElementById('identifyBtn').addEventListener('click', identifySelected);
 document.getElementById('hours').addEventListener('change', load);
 document.getElementById('freqStep').addEventListener('change', () => { resetZoom(); });
 initialLoad();
+loadRadioHealth();
 drawDeepScan();
 loadCaptures();
 setInterval(load, 60000);
 setInterval(loadCaptures, 60000);
+setInterval(loadRadioHealth, 60000);
 </script>
 </body>
 </html>
