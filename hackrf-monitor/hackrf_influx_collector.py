@@ -220,7 +220,7 @@ def main() -> int:
     parser.add_argument("--hackrf-sweep", default=os.environ.get("HACKRF_SWEEP", "hackrf_sweep"))
     parser.add_argument(
         "--sweep-args",
-        default=os.environ.get("HACKRF_SWEEP_ARGS", "-f 400:6000 -w 1000000"),
+        default=os.environ.get("HACKRF_SWEEP_ARGS", "-f 1:6000 -w 1000000"),
         help="arguments passed to hackrf_sweep; -1 is added automatically",
     )
     parser.add_argument("--interval", type=float, default=float(os.environ.get("SWEEP_INTERVAL", "60")))
