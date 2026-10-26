@@ -1,0 +1,23 @@
+[Unit]
+Description=RF Monitor v2 signal scout (detect, score, capture samples)
+Documentation=https://github.com/cmilkosky/linuxgr-rf-monitor
+After=network-online.target influxdb.service hackrf-influx.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cmilkosk
+WorkingDirectory=/home/cmilkosk/rf-monitor
+Environment=RF_MONITOR_ENV=/home/cmilkosk/.config/hackrf-influx.env
+Environment=RF_SIGNALS_DIR=/home/cmilkosk/rf-monitor/signals
+Environment=RF_HACKRF_LOCK=/tmp/hackrf-monitor-device.lock
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 rf_signal_scout.py
+Restart=on-failure
+RestartSec=10
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+
+[Install]
+WantedBy=multi-user.target

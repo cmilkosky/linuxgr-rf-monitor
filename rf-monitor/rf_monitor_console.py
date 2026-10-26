@@ -859,11 +859,15 @@ def capture_record(meta_path: Path) -> dict[str, Any]:
 def read_iq_file(iq_path: Path) -> Any:
     import numpy as np
 
-    raw = np.fromfile(iq_path, dtype=np.uint8)
+    # hackrf_transfer writes SIGNED 8-bit IQ. Reading as unsigned and subtracting
+    # 127.5 manufactures a constant DC of ~1.37x full scale, which dominates every
+    # spectrum and feature estimate (it reported ~1 kHz occupied bandwidth for a
+    # 200 kHz FM station). Signed is correct; residual DC then reads ~0.05.
+    raw = np.fromfile(iq_path, dtype=np.int8)
     if raw.size < 4096:
         raise RuntimeError("Capture file was too small to analyze")
     raw = raw[: raw.size - (raw.size % 2)]
-    iq = (raw[0::2].astype(np.float32) - 127.5) + 1j * (raw[1::2].astype(np.float32) - 127.5)
+    iq = raw[0::2].astype(np.float32) + 1j * raw[1::2].astype(np.float32)
     return iq / 128.0
 
 
@@ -1247,8 +1251,8 @@ def capture_signal(
         CAPTURE_LOCK.release()
 
 
-@app.get("/", response_class=HTMLResponse)
-def index() -> str:
+@app.get("/spectrum", response_class=HTMLResponse)
+def spectrum_page() -> str:
     return HTML
 
 
@@ -1307,7 +1311,7 @@ def asset(asset_name: str) -> FileResponse:
 
 @app.get("/api/heatmap")
 def heatmap(
-    hours: float = Query(3, ge=0.1, le=24),
+    hours: float = Query(3, ge=0.1, le=168),
     freq_step_mhz: int = Query(5, ge=1, le=100),
     time_bucket: str = Query("1m", pattern=r"^\d+[smh]$"),
     freq_min_hz: int | None = Query(None, ge=0),
@@ -1750,6 +1754,7 @@ HTML = r"""<!doctype html>
       <h1>RF Monitor</h1>
     </button>
     <nav class="tabs" aria-label="RF Monitor views">
+      <a class="tabBtn" href="/" title="Signal dashboard" style="text-decoration:none;color:var(--text);border:1px solid #35424c;border-radius:6px">← Signals</a>
       <button id="spectrumTab" class="tabBtn active" data-view="spectrumView">Spectrum</button>
       <button id="radioHealthTab" class="tabBtn" data-view="radioHealthView">Radio Health</button>
     </nav>
@@ -1759,7 +1764,7 @@ HTML = r"""<!doctype html>
 <main id="spectrumView" class="view active">
   <section>
     <div class="toolbar">
-      <label>Range <select id="hours"><option selected>1</option><option>3</option><option>6</option><option>12</option><option>24</option></select> h</label>
+      <label>Range <select id="hours"><option selected>1</option><option>3</option><option>6</option><option>12</option><option>24</option><option>48</option><option>72</option><option>168</option></select> h</label>
       <label>Frequency bin <select id="freqStep"><option>1</option><option selected>5</option><option>10</option><option>25</option><option>50</option></select> MHz</label>
       <div class="toolbarGroup">
         <label>View <input id="freqMinMhz" type="number" min="0" max="6000" step="0.001" placeholder="Start"> MHz</label>
@@ -2776,3 +2781,13 @@ setInterval(loadRadioHealth, 60000);
 </body>
 </html>
 """
+
+
+# --------------------------------------------------------------------------- #
+# RF Monitor v2 - signal dashboard.
+# Mounted last so the v1 endpoints above keep working unchanged; the Signals
+# views own "/" and the heatmap moved to "/spectrum".
+# --------------------------------------------------------------------------- #
+from signals_web import router as signals_router  # noqa: E402
+
+app.include_router(signals_router)

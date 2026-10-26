@@ -130,6 +130,7 @@ influxdb
 hackrf-influx
 rf-monitor-console
 rf-anomaly-detector
+rf-signal-scout
 rf-ha-status.timer
 ```
 
@@ -211,6 +212,109 @@ This UI needs to be RF-native:
 
 Home Assistant remains the home-automation surface for status and alerts.
 
+## v2 - Signals Dashboard
+
+The console's main page is now a **signals dashboard** (`/`); the heatmap moved to
+`/spectrum`, one click away. Instead of an anomaly stream, v2 records *signal
+episodes*: one row per emitter per day, with a strength reading, a guess at what
+it is, an optional decoded sample, and a click-through detail page.
+
+### Why the v1 anomaly gate never fired
+
+`rf-anomaly-detector` logged 6,152 consecutive runs with `anomalies=0`. Measured
+against the live bucket on 2026-10-26:
+
+| Measurement | Value |
+|---|---|
+| Per-bin median RSSI over 1 h | min −63.3, p10 −61.1, **p50 −60.0**, p90 −59.0, max −30.5 dB |
+| Bins with median above −55 dB (the old `min_rssi_db`) | **23 of 6,000** |
+| Recent 10 min max minus 6 h median | p50 6.05, p90 8.38, p99 10.84, max 21.1 dB |
+| Bins clearing 18 dB (the old `delta_db`) with a 3 min window | ~0 |
+
+The gate is not mis-scaled so much as unreachable in a useful way: the whole
+1–6 GHz span sits inside a ~33 dB band, an 18 dB jump is the extreme tail, and
+when it does fire it reports a bare 1 MHz bin with no bandwidth, no sample and no
+decode. v2 replaces it with three statistics that each cover a different case.
+
+### Detection
+
+For each of the 6,000 bins, against the 6 h per-bin median:
+
+- **strength** = recent peak − spectrum-wide noise floor → "the loudest things"
+- **excess** = recent typical level (p75) − spectrum-wide floor → "always on"
+- **delta** = recent typical level − this bin's own 6 h median → "changed"
+
+A bin is a candidate if `delta >= 8 dB` **or** `excess >= 15 dB` **or**
+`strength >= 25 dB`. Candidate bins are clustered into contiguous blobs, which
+become episodes. Thresholds were calibrated on the live spectrum: `delta >= 7 dB`
+produced 20 blobs/minute of pure noise tail (the p75-over-10-samples estimator
+has an artefact floor at ~7 dB), while `delta >= 8 dB` produced 3 real blobs.
+
+`p75` rather than `max` is deliberate: a max-of-N comparison against a median is
+biased upward by ~6 dB even for a dead-stable bin (measured p50 = 6.05 dB).
+
+Known blocks (FM broadcast, cellular downlink, Wi-Fi/ISM, CBRS, GNSS) are tagged
+`class=known` and need a higher score to earn a row, so they do not drown the
+unexplained feed. They still appear in the Strongest section, tagged, because
+they genuinely are the loudest things in the air.
+
+### Capture
+
+The HackRF is shared with the always-on sweep. Measured sweep pass time is
+0.79–0.82 s out of every 60 s, and the collector holds an `flock` on
+`/tmp/hackrf-monitor-device.lock` only during that pass, so a capture takes the
+same lock and runs in the idle window. No service is stopped or paused.
+
+Capture path details that matter:
+
+- **Signed 8-bit IQ.** `hackrf_transfer` writes int8. Reading it as unsigned and
+  subtracting 127.5 manufactures a constant DC of ~1.37x full scale and buries
+  every real signal; the same bug existed in v1's `read_iq_file` and is fixed.
+- **LO offset.** Capture is tuned 250 kHz (2 MS/s) or 600 kHz (5 MS/s) off the
+  target so the signal never sits on the HackRF DC spike. Feature extraction is
+  told the tuned centre, so reported frequencies stay absolute.
+- **DC block** before analysis, so residual LO leakage cannot masquerade as the
+  strongest peak.
+- **Gain ladder.** 32/24 dB by default; if `p99 |IQ|` exceeds 0.80 the capture is
+  retried at 24/16, 16/16, then 8/8.
+- **Sample rate** 2 MS/s for blobs ≤ 1.5 MHz wide, 5 MS/s above that.
+
+### Storage
+
+The cap is 1 GB (`RF_ARTIFACT_CAP_BYTES`). Per captured episode:
+
+| Artifact | Size |
+|---|---|
+| Spectrogram PNG (64-colour palette) | ~200 kB |
+| Audio AM / NFM / WFM as 64 kbps MP3 | ~32 kB each |
+| Features + capture metadata JSON | ~2 kB |
+| **Total** | **~310 kB** |
+
+So 1 GB holds roughly **3,200 captured signals** (~80 days at 40/day). Raw IQ is
+deleted after analysis unless a decode succeeded (`keep_iq`). When the cap is
+reached, `enforce_cap()` evicts oldest-first: raw IQ first, then whole artifact
+directories; the episode row survives with its artifacts marked purged.
+
+### Pages
+
+| Path | Purpose |
+|---|---|
+| `/` | Signals dashboard: Strongest (10), one section per decode type (20 each), Latest (50) |
+| `/signals/table` | Full table with section/type/class/band/frequency/time-range/min-strength filters, sortable columns, CSV export |
+| `/signals/<id>` | Detail: verdict, evidence lines, spectrogram, audio players, decode attempts, labels |
+| `/spectrum` | The original heatmap, unchanged, now reachable from the nav |
+| `/api/signals/sections`, `/api/signals/health`, `/api/signals/<id>` | JSON equivalents |
+
+Labels written from the detail page feed `known_emitters`, so "that's my
+neighbour's weather station" stops the frequency being reported again.
+
+### Not yet wired
+
+The decode ladder (voice transcripts, music/RDS, rtl_433 ISM, ADS-B/APRS/pager
+text, satellite images) is phase 2 onward. Episodes currently stop at
+`decode_status='captured'`, and the per-type dashboard sections show a
+"decoder lands in the next phase" placeholder.
+
 ## Roadmap
 
 Near-term:
@@ -218,16 +322,25 @@ Near-term:
 - Add visible anomaly overlays to the heatmap
 - Add presets for common bands
 - Add CSV/PNG export for a selected frequency window
-- Add capture notes and labels so interesting signals become an investigation log
-- Tune anomaly thresholds after a few days of baseline data
 
-Next phase:
+Done in v2:
 
-- Add demodulation attempts for obvious analog voice/narrow FM captures
-- Add signal investigation records with capture comparisons over time
-- Connect known signal references such as Artemis/SigID
+- ~~Add capture notes and labels so interesting signals become an investigation log~~
+- ~~Tune anomaly thresholds after a few days of baseline data~~ (replaced by the
+  three-statistic detector; see the calibration table above)
 
-Later:
+Next phase (v2 decoders, in priority order):
+
+1. RTL-SDR capture lane (RTL2/RTL3, 24–1766 MHz) so decoding does not compete
+   with the HackRF, plus voice demodulation and transcripts via
+   `POST http://192.168.202.59:10301/transcribe`
+2. Music: FM RDS via `redsea`, plus music detection on non-broadcast signals
+3. ISM sensors/TPMS via `rtl_433` (433/915 MHz)
+4. Aircraft/APRS/pager text: `readsb`, `direwolf`, `multimon-ng`, `acarsdec`
+5. Satellite images: `satdump` (NOAA APT, Meteor LRPT) with TLE pass scheduling
+6. Learned whitelist from operator labels, and 7-day novelty ranking
+
+Still unimplemented:
 
 - Automatic modulation/signal classification
 - Voice vs digital heuristics
