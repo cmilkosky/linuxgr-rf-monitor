@@ -8,8 +8,8 @@ the brief for v3.
 
 | Fact | Value |
 |---|---|
-| Sweep command | `hackrf_sweep -f 1:6000 -w 1000000 -1` (from `HACKRF_SWEEP_ARGS`) |
-| Sweep coverage | 1 – 6000 MHz, 6000 bins, **1 MHz resolution** |
+| Sweep command | `hackrf_sweep -f 25:3000 -w 500000 -1` (from `HACKRF_SWEEP_ARGS`) |
+| Sweep coverage | 25 – 3000 MHz, 6556 bins, **~455 kHz median step** |
 | Sweep duty | 0.79 – 0.82 s active per 60 s interval |
 | Episodes recorded | 482 (427 captured) |
 | Episode rate | 11 – 20 per hour ≈ 380/day (target was 15 – 25/day) |
@@ -141,10 +141,106 @@ The queue needs a priority: a scheduled satellite pass outranks opportunistic
 capture, and a candidate that has already failed one decode attempt drops to the
 back.
 
+## Resolution: how small should the steps be?
+
+Measured on linuxGR with `-f 25:3000`, timed under the device flock:
+
+| Bin width | Bins | Sweep time | Points/day | vs today |
+|---|---|---|---|---|
+| 1 MHz | 2,975 | 494 ms | 4.28 M | 0.5x |
+| **500 kHz (applied)** | **5,950** | **456 ms** | **8.57 M** | **1.0x** |
+| 250 kHz | 11,900 | 461 ms | 17.1 M | 2x |
+| 100 kHz | 29,750 | 457 ms | 42.8 M | 5x |
+| 20 kHz | 148,750 | 554 ms | 214 M | 25x |
+
+**Sweep time is flat.** Going from 1 MHz to 20 kHz bins costs 60 ms, because the
+HackRF's sweep time is set by how many 20 MHz hops it makes, not by the FFT
+resolution inside each hop. Resolution is therefore free in *time* and expensive
+only in *data*.
+
+What finer bins actually buy — and one thing they do not:
+
+- FFT bins are contiguous, so there are no "gaps" between 100.0 and 101.0 MHz to
+  go looking for. A 12.5 kHz APRS burst already lands in a bin at 1 MHz
+  resolution; it is not missed because it fell between steps.
+- Finer bins lower the noise per bin, so narrowband signals gain SNR — halving
+  the bin width is worth about **3 dB**. Measured median floor over the new
+  25–3000 span is **-63.1 dB** vs **-60.0 dB** over the old 1–6000 span; the band
+  changed too, so treat that as consistent with the 3 dB, not as a clean A/B.
+- Finer bins separate adjacent channels and let the sweep estimate bandwidth
+  rather than merely flag a peak.
+
+Why not go to 100 kHz: 42.8 M points/day is 5x today, which at 30-day retention
+is 1.28 billion points and would push the 168 h query from 88 s to roughly 440 s.
+That is not viable without shortening raw retention to ~7 days. 500 kHz costs
+exactly what today costs and doubles resolution, so that is where it stays.
+
+Detail below ~100 kHz is the capture radio's job: it sees 2.4–5 MHz
+instantaneously at sub-kHz resolution, which no sweep can match.
+
+## Scanning method: is more scanning the answer?
+
+The sweep observes each 20 MHz segment for about **3.4 ms once per 60 s**
+(0.5 s of work spread over ~149 hops). A signal has to be on air during that
+window to be seen. That is fine for continuous carriers and poor for bursts:
+APRS beacons last ~0.5 s, pager bursts 1–2 s, ADS-B frames 120 us.
+
+So more sweeping helps only linearly and is the wrong lever. The right
+architecture is:
+
+- **sweep = discovery** — finds persistent, strong, unexplained carriers
+- **continuous lanes = burst capture** — a receiver parked on a known channel,
+  decoding 24/7, never missing a burst
+
+### Should the RTL-SDRs share the scan load?
+
+No. An RTL-SDR is 2.4 MS/s, so it sees 2.4 MHz at a time; covering 25–1766 MHz
+takes ~725 retunes at 15–20 ms each, i.e. 11–15 s per sweep — slower and coarser
+than the HackRF's 0.5 s. They are bad scanners and good **channel monitors**.
+
+Dedicate each dongle to a lane instead:
+
+| Dongle | Slice | Decoder |
+|---|---|---|
+| RTL2 | 143.2 – 145.6 MHz | `direwolf` (APRS 144.39) |
+| RTL3 | 1088 – 1091 MHz | `readsb` / `dump1090` (ADS-B 1090) |
+| spare | 162.4 – 162.6 MHz | NOAA weather, or a trunked control channel |
+
+### Trunked audio (EMT / fire / police)
+
+Still entirely doable, and it fits the same model. `trunk-recorder` (or `op25`)
+follows a P25 / Motorola trunked system: one dongle holds the control channel,
+one dongle per simultaneous voice call. Each decoded call becomes an episode —
+talkgroup, agency, duration, and a transcript — so a fire call shows up in the
+Signals feed next to the RF discoveries.
+
+Two honest caveats: it needs the control-channel frequency and system type, which
+are found by scanning for a continuous carrier in 769–775 / 851–869 MHz; and many
+police systems are P25 AES-encrypted, where you will see the call grant but not
+the audio. Fire and EMS are frequently in the clear.
+
+## PortaPack H2+ as the second HackRF
+
+Yes — the H2+ is a HackRF One with a screen and controls attached, so it can be
+repurposed as a plain HackRF. Flashing stock HackRF firmware (or selecting
+HackRF mode in the Mayhem firmware) makes it enumerate as a standard HackRF One
+over USB. Verify with `hackrf_info`, which should list **two devices with
+distinct serials**; after that every tool takes `-d <serial>` to pick one.
+
+Two things to check once it is plugged in: the H2+'s clock reference (a plain
+HackRF One has no TCXO, and clock error matters at 1090 MHz), and that it
+actually sustains 20 MS/s over USB.
+
+With two radios the split becomes: one HackRF sweeps continuously, the other
+dwells and decodes. Both fed from the 1-in/4-out splitter, so both see the
+D3000N.
+
 ## Open decisions for Chris
 
-1. Approve changing the sweep to `-f 25:3000 -w 500000` (halves the span, doubles
-   resolution, drops the 31 % of episodes from outside the antenna).
-2. Second HackRF One, or start with the two RTL-SDRs for narrowband decode?
-3. Confirm the noise gate thresholds once measured on real captures.
-4. Keep the 15 – 25 rows/day target as the acceptance test for the gate.
+1. ~~Sweep to `-f 25:3000 -w 500000`~~ — **applied 2026-10-27 16:28 UTC**, verified
+   span 25.227–3004.773 MHz at 455 kHz median step.
+2. Second radio: PortaPack H2+ in HackRF mode (Chris to enable), or start with the
+   two RTL-SDRs as continuous decode lanes.
+3. Which RTL lanes to run first — APRS, ADS-B, or a trunked control channel?
+4. Confirm the noise gate thresholds once measured on real captures.
+5. Keep the 15 – 25 rows/day target as the acceptance test for the gate.
