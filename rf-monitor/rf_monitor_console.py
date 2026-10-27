@@ -55,7 +55,7 @@ INFLUX_TOKEN = ENV["INFLUX_TOKEN"]
 app = FastAPI(title="RF Monitor Console")
 
 
-def flux_query(query: str) -> list[dict[str, str]]:
+def flux_query(query: str, timeout: float = 75) -> list[dict[str, str]]:
     try:
         response = requests.post(
             f"{INFLUX_URL}/api/v2/query",
@@ -66,7 +66,7 @@ def flux_query(query: str) -> list[dict[str, str]]:
                 "Content-Type": "application/vnd.flux",
             },
             data=query,
-            timeout=75,
+            timeout=timeout,
         )
     except requests.Timeout as exc:
         raise HTTPException(504, "InfluxDB query timed out; try a shorter range or wider frequency bin") from exc
@@ -1322,19 +1322,39 @@ def heatmap(
     freq_filter = ""
     if freq_min_hz is not None and freq_max_hz is not None and freq_max_hz > freq_min_hz:
         freq_filter = f"\n  |> filter(fn: (r) => int(v: r.frequency_hz) >= {freq_min_hz} and int(v: r.frequency_hz) <= {freq_max_hz})"
-    query = f'''
+
+    if hours > 24:
+        # A week of raw sweep data is 59.9M points / 3.8 GB, and every Flux-side
+        # reduction measured SLOWER than the raw transfer on this host
+        # (aggregateWindow 161s, decimate+filter 253s), so long ranges read the
+        # precomputed 5 MHz / 10 min max-hold rollup written by rf-rollup.timer.
+        bucket_seconds = max(parse_bucket_seconds(time_bucket), 600)
+        rollup_filter = ""
+        if freq_min_hz is not None and freq_max_hz is not None and freq_max_hz > freq_min_hz:
+            rollup_filter = f"\n  |> filter(fn: (r) => int(v: r.freq_bin) >= {freq_min_hz} and int(v: r.freq_bin) <= {freq_max_hz})"
+        query = f'''
+from(bucket: "{INFLUX_BUCKET}")
+  |> range(start: -{range_duration})
+  |> filter(fn: (r) => r._measurement == "rf_rollup" and r._field == "rssi_db")
+  {rollup_filter}
+  |> keep(columns: ["_time", "_value", "freq_bin"])
+'''
+        freq_column = "freq_bin"
+    else:
+        bucket_seconds = parse_bucket_seconds(time_bucket)
+        query = f'''
 from(bucket: "{INFLUX_BUCKET}")
   |> range(start: -{range_duration})
   |> filter(fn: (r) => r._measurement == "rf_sweep" and r._field == "rssi_db")
   {freq_filter}
   |> keep(columns: ["_time", "_value", "frequency_hz"])
 '''
-    rows = flux_query(query)
-    bucket_seconds = parse_bucket_seconds(time_bucket)
+        freq_column = "frequency_hz"
+    rows = flux_query(query, timeout=120.0)
     grouped: dict[tuple[str, int], float] = {}
     for row in rows:
         time_key = bucket_time_iso(row["_time"], bucket_seconds)
-        freq_bin = int(row["frequency_hz"]) // step_hz * step_hz
+        freq_bin = int(row[freq_column]) // step_hz * step_hz
         key = (time_key, freq_bin)
         value = float(row["_value"])
         if key not in grouped or value > grouped[key]:
@@ -1360,6 +1380,7 @@ from(bucket: "{INFLUX_BUCKET}")
             "max": max_v,
             "points": len(grouped),
             "raw_points": len(rows),
+            "bucket_seconds": bucket_seconds,
             "freq_min_hz": freq_min_hz,
             "freq_max_hz": freq_max_hz,
         }

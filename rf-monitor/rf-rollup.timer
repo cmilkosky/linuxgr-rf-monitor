@@ -1,0 +1,12 @@
+[Unit]
+Description=Roll up RF sweep data every 10 minutes for the long-range heatmap
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+AccuracySec=1min
+Persistent=true
+Unit=rf-rollup.service
+
+[Install]
+WantedBy=timers.target

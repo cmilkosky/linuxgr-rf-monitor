@@ -308,6 +308,31 @@ directories; the episode row survives with its artifacts marked purged.
 Labels written from the detail page feed `known_emitters`, so "that's my
 neighbour's weather station" stops the frequency being reported again.
 
+### 7-day heatmap (rollup)
+
+The heatmap range selector offers up to 168 h, but a week cannot be served from
+raw sweep data. Measured on this host:
+
+| Query for 168 h | Time | Payload |
+|---|---|---|
+| raw `rf_sweep` | 88.2 s | 59.9M points / 3.79 GB |
+| `aggregateWindow` 6720 s | 161.5 s | 546k rows / 63 MB |
+| decimate to 10 min + 5 MHz filter | 252.8 s | 1.2M rows / 75 MB |
+
+Every Flux-side reduction was **slower** than the raw transfer, because the scan
+still touches all 59.9M points and the grouping/filter evaluation costs more than
+the bytes it saves. `rf_rollup.py` therefore precomputes a max-hold rollup:
+
+- one point per (5 MHz bin, 10 min window) holding the max RSSI in that window
+- `rf-rollup.timer` runs `rf-rollup.service` every 10 minutes as `cmilkosk`
+- measurement `rf_rollup`, tag `freq_bin`, field `rssi_db`, written to the same
+  bucket (so the 30-day retention applies)
+- 7 days = 1.2M points; the endpoint reads them in **8.4 s** and returns 7.3 MB
+
+`/api/heatmap` uses raw data at or below 24 h (1 h = 1.7 s) and the rollup above
+24 h. Backfilling a week is a one-off: `rf_rollup.py --backfill-hours 168`
+(1008 windows, ~10 min).
+
 ### Not yet wired
 
 The decode ladder (voice transcripts, music/RDS, rtl_433 ISM, ADS-B/APRS/pager

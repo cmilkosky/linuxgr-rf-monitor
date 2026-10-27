@@ -1,0 +1,16 @@
+[Unit]
+Description=RF Monitor sweep rollup (5 MHz / 10 min max-hold for long-range heatmap)
+Documentation=https://github.com/cmilkosky/linuxgr-rf-monitor
+After=network-online.target influxdb.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=cmilkosk
+WorkingDirectory=/home/cmilkosk/rf-monitor
+EnvironmentFile=/home/cmilkosk/.config/hackrf-influx.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 rf_rollup.py --window-minutes 10
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
