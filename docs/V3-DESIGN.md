@@ -248,20 +248,40 @@ than a shared passive splitter can explain.
 | 104 MHz | -76.3 | -54.9 | +21.4 |
 | 109 MHz | -59.5 | **-93.4** | **-33.9** |
 
-A 4-way passive splitter gives every port the same signals at roughly equal
-level. It cannot produce +45 dB at one frequency and -34 dB at another. So one of
-these is true, and it has to be settled physically before the radio is used:
+### Resolution: the feed IS shared; the PortaPack has internal spurs
 
-1. the PortaPack is not actually on the shared antenna (SMA not seated, or on a
-   different feed) — most likely, given it was swapped in for a removed RTL
-2. the PortaPack front end is unfiltered and generating intermodulation products
-   from strong out-of-band signals
-3. the splitter port it landed on is damaged — note an RTL on USB path
-   `7-1.1.4` was flapping (repeated connect/disconnect) just before the swap
+Chris confirmed the antenna is screwed directly into the PortaPack. Re-testing
+proves the feed is shared after all — the disagreement is not a feed fault:
 
-**Verdict:** usable as a capture radio (tuning and streaming are verified), not
-yet usable as a scanner or as a correlated second radio. Re-run the comparison
-after confirming the physical feed.
+| Frequency | main | PortaPack | delta |
+|---|---|---|---|
+| 94.5 MHz (FM station) | -47.0 | -44.3 | **+2.8** |
+| 103.3 MHz (FM station) | -29.0 | -29.0 | 0.0 |
+
+Per-2-MHz median agreement across 88-108 MHz is within a few dB everywhere except
+100-102 MHz, and the two radios receive the same stations at the same levels. So
+both really are on the D3000N, and the earlier "not on the shared feed" verdict
+was wrong.
+
+The extra energy the PortaPack reports at ~101.5 and ~89.0 MHz is generated
+**inside the unit**. Proof is the RF amp test — the HackRF's +11 dB amp sits at
+the antenna input, so genuine RF must rise when it is enabled:
+
+| probe | amp off | amp on | delta | verdict |
+|---|---|---|---|---|
+| 94.5 MHz station | -43.9 | -31.9 | **+12.0** | real RF |
+| 103.3 MHz station | -27.7 | -16.6 | **+11.1** | real RF |
+| 101.5 MHz suspect | -24.6 | -31.2 | **-6.5** | internal spur |
+| 89.0 MHz suspect | -43.4 | -51.0 | **-7.6** | internal spur |
+
+Real signals rise ~11-12 dB; the suspects move the *other* way. That is the
+signature of an internally generated product (digital section / LCD coupling into
+the RF front end), not of anything arriving at the antenna.
+
+**Verdict:** the PortaPack is a genuine second HackRF on the shared antenna, with
+a clean tuning and streaming path, but it has internal spurs at ~89.0 and
+~101.5 MHz that would be falsely detected as signals. Use it for **capture**, and
+mask the known spur frequencies; do not use it as a blind scanner.
 
 The collector is now pinned with `-d 0000000000000000f75461dc2696a6c3` so device
 enumeration order can never move the sweep onto the other radio.
@@ -295,19 +315,50 @@ Options, from cheapest to best-matched:
 
 | Option | Coverage | Gain | Price | Notes |
 |---|---|---|---|---|
-| RTL-SDR Blog Wideband LNA | 20 MHz – 2 GHz | ~20 dB flat | ~$30 | community default, bias-tee powered, stops at 2 GHz |
+| **RTL-SDR Blog Wideband LNA V2** | **100 MHz – 6 GHz** | fixed (QPL9547, ~18-20 dB class — listing does not quote it) | **$19.95** | NF <1 dB, best value by far for a 25-3000 MHz system |
 | Nooelec VeGA | wideband | adjustable | ~$50 | adjustable gain is safer for a scanner |
 | Mini-Circuits ZX60-P103LN+ | 50 – 3000 MHz | 25.2 dB @50 MHz → 6.9 dB @3 GHz | ~$150-200 | NF 0.4–1.0 dB, survives +21/+26 dBm input, SMA, 5 V/95 mA |
 
-Required alongside any of them: an **FM broadcast band-stop filter** (the
-RTL-SDR Blog unit is the one the community rates above Nooelec) to stop 88–108
-MHz overload, and a **switched attenuator or limiter** between LNA and radio.
-Without those two, an LNA makes the HackRF both deafer and more fragile.
+**Power caveat that decides the wiring:** the RTL-SDR Blog LNA V2 needs **3–5 V
+at 90 mA** through a bias tee. The HackRF's antenna-port bias tee supplies only
+**3.3 V at 50 mA max**, so it cannot power this LNA. It needs an external bias
+tee / power inserter at the radio end of the coax, or external power at the mast.
 
-A passive splitter plus a mast LNA is still lossy. The cleaner answer for four
-radios is an **active multicoupler** (Stridsberg and similar), which amplifies
-and splits in one box with low port-to-port isolation loss — that replaces the
-passive splitter rather than adding to it.
+### FM broadcast band-stop filter
+
+Yes — it does one thing: it blocks the FM broadcast band, **88–108 MHz**, with
+over **50 dB** of attenuation, and passes everything else with **<0.5 dB** loss
+from 0–1 GHz and **<1.5 dB** from 1–3 GHz. RTL-SDR Blog unit, **$16.95**. It is a
+receive-only part. Its purpose is to stop a strong local FM station from
+overloading the LNA or the SDR; it does not attenuate anything outside 88–108.
+
+### Limiter vs switched attenuator — different jobs
+
+- **Limiter** — automatic protection. It passes weak signals untouched and
+  clamps anything above its threshold. Mini-Circuits **ZFLM-43-5W+**: 20–4000 MHz,
+  limits inputs from +10 to +37 dBm down to about +12 dBm output, SMA, 0.5 dB
+  insertion loss. This is what stands between a strong signal and a dead HackRF.
+- **Switched (step) attenuator** — a manual pad you dial in, reducing *everything*
+  by a known amount. Mini-Circuits **ZX76-31A-PNS+**: 0–31 dB in 1 dB steps, SMA,
+  digitally controlled. Manual rotary step attenuators do the same job for less
+  money. You use it to take the LNA's gain back out when signals are hot, or to
+  keep the HackRF's total input below −5 dBm.
+
+Both, not either: the limiter handles the accidental spike, the attenuator sets
+the working level.
+
+### Active multicoupler — check the frequency range first
+
+Stridsberg **MCA204M** is the scanner-community standard 4-port active
+multicoupler: 25 MHz – 1 GHz, 22 dB port isolation, 12 V/85 mA, ~$185–229.
+Links: <http://www.stridsbergeng.com/multicouplers.html> and
+<https://www.scannermaster.com/Multicouplers-for-Police-Scanner-Radios-s/830.htm>
+
+**Important limitation for this project:** it stops at **1 GHz**. It is the right
+box for trunked/public-safety work in the 25–1000 MHz range, but it cannot
+replace a splitter for a 25–3000 MHz system. For full coverage the practical
+route is a mast LNA plus a passive 4-way splitter rated to 3 GHz, with the FM
+band-stop filter in front.
 
 ## Open decisions for Chris
 
