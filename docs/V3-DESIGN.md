@@ -347,18 +347,58 @@ overloading the LNA or the SDR; it does not attenuate anything outside 88–108.
 Both, not either: the limiter handles the accidental spike, the attenuator sets
 the working level.
 
-### Active multicoupler — check the frequency range first
+### The splitter is a Stridsberg MCA204M — what that means above 1 GHz
 
-Stridsberg **MCA204M** is the scanner-community standard 4-port active
-multicoupler: 25 MHz – 1 GHz, 22 dB port isolation, 12 V/85 mA, ~$185–229.
-Links: <http://www.stridsbergeng.com/multicouplers.html> and
-<https://www.scannermaster.com/Multicouplers-for-Police-Scanner-Radios-s/830.htm>
+Chris's 1-in/4-out splitter **is** the MCA204M, so the whole system passes
+through it. Published specs: 25 MHz – 1 GHz, 4 ports, 22 dB port-to-port
+isolation, P1dB +17 dBm out, OIP3 +31/+32 dBm, gain +2 to -1 dB, 12 V @ 85 mA,
+BNC connectors, and an **input high-pass filter at 25 MHz** (5-section) to reject
+low-frequency energy.
 
-**Important limitation for this project:** it stops at **1 GHz**. It is the right
-box for trunked/public-safety work in the 25–1000 MHz range, but it cannot
-replace a splitter for a 25–3000 MHz system. For full coverage the practical
-route is a mast LNA plus a passive 4-way splitter rated to 3 GHz, with the FM
-band-stop filter in front.
+**It has no low-pass filter at 1 GHz.** Stridsberg's own tech note says the
+couplers "range from 25 MHz to 1 GHz, and beyond with slightly relaxed
+specifications. In fact, the active couplers are useable up to about 1.2 GHz."
+Above that the internal amplifier gain rolls off gradually — it degrades, it does
+not cut off. So 1–3 GHz is not lost, it is just received weaker and outside the
+guaranteed spec (gain flatness, isolation, return loss all relax).
+
+Measured on live sweep data (30 min, 6,556 bins, overall floor -63.2 dB):
+
+| Band | Strongest bin | Above floor |
+|---|---|---|
+| 1225 / 1240 MHz | -51.4 / -49.9 dB | +11.8 / +13.3 |
+| 1029 MHz | -55.0 dB | +8.2 |
+| 2.4 GHz ISM | -59.7 dB | +3.5 |
+| 1.9 GHz cellular | -60.8 dB | +2.4 |
+
+Signals above 1 GHz are getting through, with a rolloff consistent with the
+datasheet. The noise floor is *not* evidence either way — it is flat at -63.2 dB
+across 0.8-3 GHz because it is set by the HackRF's own front end, so an upstream
+loss would not move it. Quantifying the exact rolloff needs an A/B test with the
+HackRF bypassing the multicoupler.
+
+Two corrections this forces on the earlier reasoning:
+
+1. The MCA204M is **active with near-unity gain**, so there is no 6-7 dB passive
+   splitter loss to recover. The LNA's justification is therefore *not* splitter
+   loss; it is noise figure (an LNA ahead of the multicoupler takes the cascaded
+   NF from roughly 14 dB to under 2 dB) and compensating the post-1.2 GHz
+   rolloff.
+2. A passive 3 GHz splitter is not needed to "fix" anything — the existing
+   multicoupler already passes the band, just with relaxed specs up top.
+
+### Powering the LNA — skip the bias tee
+
+The RTL-SDR Blog LNA V2 needs 3-5 V at 90 mA, more than the HackRF's 3.3 V/50 mA
+bias tee can supply. Rather than buy an inserter, the simpler part is the
+**Nooelec LaNA** ($37.95 with enclosure, $32.95 barebones): 20 MHz – 4 GHz,
+powered by bias tee *or* microUSB *or* DC barrel, 50-80 mA, aluminium enclosure.
+It covers the low end better (20 MHz vs 100 MHz) and needs no inserter at all.
+
+If the RTL-SDR LNA V2 is already owned and an inserter is wanted anyway:
+Mini-Circuits **ZFBT-6GW+** (10-6000 MHz, 500 mA, SMA, 0.6 dB IL) or the
+lower-cost **ZX85-12G+** (0.2-12 GHz, 400 mA). Both are far more expensive than
+the LaNA itself.
 
 ## Open decisions for Chris
 
