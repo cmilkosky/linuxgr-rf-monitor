@@ -219,21 +219,95 @@ are found by scanning for a continuous carrier in 769–775 / 851–869 MHz; and
 police systems are P25 AES-encrypted, where you will see the call grant but not
 the audio. Fire and EMS are frequently in the clear.
 
-## PortaPack H2+ as the second HackRF
+## PortaPack H2+ as the second HackRF — measured 2026-10-27
 
-Yes — the H2+ is a HackRF One with a screen and controls attached, so it can be
-repurposed as a plain HackRF. Flashing stock HackRF firmware (or selecting
-HackRF mode in the Mayhem firmware) makes it enumerate as a standard HackRF One
-over USB. Verify with `hackrf_info`, which should list **two devices with
-distinct serials**; after that every tool takes `-d <serial>` to pick one.
+Plugged into linuxGR and inspected. It needs **no firmware update**: the Mayhem
+firmware (v2.1.0, API 1.08) already exposes HackRF mode, and both devices answer
+`hackrf_info`:
 
-Two things to check once it is plugged in: the H2+'s clock reference (a plain
-HackRF One has no TCXO, and clock error matters at 1090 MHz), and that it
-actually sustains 20 MS/s over USB.
+| Role | Serial | Firmware | Board |
+|---|---|---|---|
+| main HackRF One | `0000000000000000f75461dc2696a6c3` | 2023.01.1 (API 1.07) | 4 (r9) |
+| PortaPack H2+ | `000000000000000016bc62dc2e4c22a7` | v2.1.0 (API 1.08) | 4 (r9) |
 
-With two radios the split becomes: one HackRF sweeps continuously, the other
-dwells and decodes. Both fed from the 1-in/4-out splitter, so both see the
-D3000N.
+What works:
+
+- enumerates as `1d50:6089 HackRF One SDR`
+- streams **20 MS/s** (40 MB in 1 s, correct for int8 I/Q)
+- sweeps 25–3000 MHz in **447 ms**, identical to the main radio's 446 ms
+- tunes accurately — on 103.300 MHz the carrier landed **6.85 kHz** off centre
+
+What does not work: **its spectrum disagrees with the main radio**, by far more
+than a shared passive splitter can explain.
+
+| Frequency | main | PortaPack | delta |
+|---|---|---|---|
+| 100 MHz | -69.8 | -59.1 | +10.7 |
+| 101 MHz | -69.7 | **-24.4** | **+45.3** |
+| 103 MHz | -68.8 | -40.7 | +28.1 |
+| 104 MHz | -76.3 | -54.9 | +21.4 |
+| 109 MHz | -59.5 | **-93.4** | **-33.9** |
+
+A 4-way passive splitter gives every port the same signals at roughly equal
+level. It cannot produce +45 dB at one frequency and -34 dB at another. So one of
+these is true, and it has to be settled physically before the radio is used:
+
+1. the PortaPack is not actually on the shared antenna (SMA not seated, or on a
+   different feed) — most likely, given it was swapped in for a removed RTL
+2. the PortaPack front end is unfiltered and generating intermodulation products
+   from strong out-of-band signals
+3. the splitter port it landed on is damaged — note an RTL on USB path
+   `7-1.1.4` was flapping (repeated connect/disconnect) just before the swap
+
+**Verdict:** usable as a capture radio (tuning and streaming are verified), not
+yet usable as a scanner or as a correlated second radio. Re-run the comparison
+after confirming the physical feed.
+
+The collector is now pinned with `-d 0000000000000000f75461dc2696a6c3` so device
+enumeration order can never move the sweep onto the other radio.
+
+### Antenna budget
+
+The 1-in/4-out splitter is now **full**: main HackRF, PortaPack, RTL2, RTL3. Any
+further radio needs a larger splitter, an active multicoupler, or a switched
+arrangement.
+
+## Low-noise amplifier: is it worth it?
+
+Yes, but not as a blanket wideband amplifier, and only with protection. The
+numbers that decide it:
+
+- **HackRF One maximum input power is -5 dBm** and exceeding it causes permanent
+  damage (official HackRF docs). It can survive +10 dBm only with the front-end
+  RX amp disabled, and a software slip can re-enable it.
+- A 25 dB LNA in front of the HackRF therefore means the antenna signal must stay
+  below **-30 dBm**. A nearby FM station at a discone can be -20 to -10 dBm.
+- The HackRF is 8-bit with no front-end filter, so it overloads long before a
+  12-16 bit SDR would.
+
+Where an LNA genuinely pays: the 4-way passive splitter costs ~6-7 dB per port.
+An LNA mounted **at the antenna, before the splitter**, recovers that loss for
+every radio at once and sets the system noise figure at the mast instead of the
+shack. That is the strongest argument in favour, and it is an argument about
+splitter loss, not about sensitivity per se.
+
+Options, from cheapest to best-matched:
+
+| Option | Coverage | Gain | Price | Notes |
+|---|---|---|---|---|
+| RTL-SDR Blog Wideband LNA | 20 MHz – 2 GHz | ~20 dB flat | ~$30 | community default, bias-tee powered, stops at 2 GHz |
+| Nooelec VeGA | wideband | adjustable | ~$50 | adjustable gain is safer for a scanner |
+| Mini-Circuits ZX60-P103LN+ | 50 – 3000 MHz | 25.2 dB @50 MHz → 6.9 dB @3 GHz | ~$150-200 | NF 0.4–1.0 dB, survives +21/+26 dBm input, SMA, 5 V/95 mA |
+
+Required alongside any of them: an **FM broadcast band-stop filter** (the
+RTL-SDR Blog unit is the one the community rates above Nooelec) to stop 88–108
+MHz overload, and a **switched attenuator or limiter** between LNA and radio.
+Without those two, an LNA makes the HackRF both deafer and more fragile.
+
+A passive splitter plus a mast LNA is still lossy. The cleaner answer for four
+radios is an **active multicoupler** (Stridsberg and similar), which amplifies
+and splits in one box with low port-to-port isolation loss — that replaces the
+passive splitter rather than adding to it.
 
 ## Open decisions for Chris
 
