@@ -395,6 +395,34 @@ bias tee can supply. Rather than buy an inserter, the simpler part is the
 powered by bias tee *or* microUSB *or* DC barrel, 50-80 mA, aluminium enclosure.
 It covers the low end better (20 MHz vs 100 MHz) and needs no inserter at all.
 
+Published gain curve (Nooelec support article):
+
+| MHz | 50 | 100 | 500 | 1000 | 1500 | 2000 |
+|---|---|---|---|---|---|---|
+| Gain dB | 26 | 24 | 24 | 20 | 17 | 16 |
+
+That curve is a good match for this system: 24-26 dB across the busy VHF/UHF
+range, and still 16-20 dB at 1-2 GHz, which props up exactly where the MCA204M
+rolls off.
+
+**DC block is mandatory with external power.** The LaNA's own listing warns that
+some SDRs need a DC block between LNA and SDR when using the USB/DC power
+options, and there is a documented case of a USB-powered LNA back-feeding 5 V
+into the HackRF's 3.3 V bias-tee rail and damaging it. The HackRF's bias tee must
+stay OFF, and a DC block (Nooelec sells one, ~$10) goes between the LaNA output
+and the multicoupler.
+
+**Signal chain, in order:**
+
+```
+D3000N -> FM band-stop -> LaNA -> DC block -> MCA204M -> {HackRF, PortaPack, RTL2, RTL3}
+```
+
+The FM trap goes **before** the LNA, not after: the LaNA's input is rated for
+under 0 dBm, and a strong local FM station at the antenna can exceed that. With
+24-26 dB of gain in line, anything that was within 26 dB of the HackRF's -5 dBm
+damage limit now exceeds it, so the trap and a limiter are not optional.
+
 If the RTL-SDR LNA V2 is already owned and an inserter is wanted anyway:
 Mini-Circuits **ZFBT-6GW+** (10-6000 MHz, 500 mA, SMA, 0.6 dB IL) or the
 lower-cost **ZX85-12G+** (0.2-12 GHz, 400 mA). Both are far more expensive than
