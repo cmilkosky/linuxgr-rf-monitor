@@ -153,6 +153,17 @@ def _hit(decoder: str, protocol: str, line: str, freq_hz: int) -> dict[str, Any]
 
 _HIT_RE = re.compile(r"^([A-Z][A-Z0-9_]+):\s*(.+)$")
 
+# multimon-ng emits synthetic frames on noise - "fm ? to ;-</UO-9 QSO Nr 2483" is
+# not a packet anyone sent, it is the decoder guessing at random bits. Two of them
+# reached the dashboard as APRS before this filter existed. A real AX.25 frame has
+# a callsign on both sides of "to".
+_AX25_HEADER_RE = re.compile(r"\bfm\s+([A-Z0-9]{1,6}(?:-\d{1,2})?)\s+to\s+([A-Z0-9]{1,6}(?:-\d{1,2})?)\b")
+
+
+def ax25_header_valid(line: str) -> bool:
+    """True when the frame carries a plausible AX.25 source and destination."""
+    return bool(_AX25_HEADER_RE.search(line))
+
 
 def parse_multimon(output: str, freq_hz: int) -> list[dict[str, Any]]:
     """Keep only frames from protocols in PROTOCOL_TYPES; drop the rest.
@@ -175,6 +186,9 @@ def parse_multimon(output: str, freq_hz: int) -> list[dict[str, Any]]:
                 current = None
                 continue
             current = _hit("multimon-ng", protocol, line, freq_hz)
+            if current["decode_type"] == "aprs" and not ax25_header_valid(line):
+                current = None
+                continue
             hits.append(current)
         elif current is not None:
             current["line"] = f"{current['line']} {line}".strip()

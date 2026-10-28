@@ -191,6 +191,19 @@ def main() -> int:
     except ImportError:
         print("SKIP: cu8 test needs numpy")
 
+    # AX.25 header validation: multimon emits synthetic frames on noise
+    fake = "\n".join([
+        "AFSK2400_3: fm ? to ;-</UO-9 QSO Nr 2483 I35+ p",
+        "FSK9600: fm ? to 0]+/1--8 QSO Nr 12654 RNR0-",
+        "AFSK1200: fm N0CALL-9 to APRS-0 via WIDE1-1 UI  pid=F0",
+    ])
+    parsed = rf_decode.parse_multimon(fake, 144_390_000)
+    if len(parsed) != 1:
+        print(f"FAIL: AX.25 header filter kept {len(parsed)} frames, expected only the valid one")
+        failures += 1
+    else:
+        print("PASS: unvalidated AX.25 headers dropped (multimon 'fm ? to' noise frames)")
+
     print("FAILURES:", failures)
     return 1 if failures else 0
 
