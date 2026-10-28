@@ -379,6 +379,10 @@ def capture_and_analyse(
         tune_hz = frequency_hz - offset_hz
     out_dir.mkdir(parents=True, exist_ok=True)
     iq_path = out_dir / "capture.iq"
+    # A capture killed mid-dwell (service restart, SIGTERM) leaves its chunk files
+    # behind - 4 MB/s of disk each, and they count against the artifact cap.
+    for stale in out_dir.glob("capture.part*.iq"):
+        stale.unlink(missing_ok=True)
 
     base_seconds = float(duration_seconds or CAPTURE_SECONDS)
     max_seconds = max(base_seconds, float(max_duration_seconds or base_seconds))
