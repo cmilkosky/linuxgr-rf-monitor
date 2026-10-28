@@ -312,6 +312,19 @@ def set_decode_status(episode_id: int, status: str, detail: str | None = None) -
         conn.commit()
 
 
+def record_attempt(episode_id: int, decoder: str, status: str, detail: str | None,
+                   started_at: str | None = None) -> None:
+    """Log one decoder attempt. `status` is ok / no_frame / error / skipped."""
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO decode_attempts (episode_id, decoder, status, detail, started_at, finished_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (int(episode_id), str(decoder), str(status), (detail or "")[:500],
+             started_at or utcnow(), utcnow()),
+        )
+        conn.commit()
+
+
 def set_intel(episode_id: int, intel: dict[str, Any]) -> None:
     import json
 

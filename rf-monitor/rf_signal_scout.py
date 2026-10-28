@@ -349,16 +349,30 @@ def describe_blob(blob: dict[str, Any], known: str | None) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # capture queue
 # --------------------------------------------------------------------------- #
+def _live_decoder(target_hz: int):
+    """Build a decode callback bound to one episode's frequency."""
+    def callback(iq, sample_rate_hz: int, tune_hz: int, out_dir: Path) -> list[dict[str, Any]]:
+        import rf_decode
+
+        return rf_decode.decode_iq_hits(iq, sample_rate_hz, tune_hz, target_hz)
+
+    return callback
+
+
 def process_captures(env: dict[str, str], budget: int) -> list[str]:
     if budget <= 0:
         return []
     import rf_v2_capture as capture
+    import rf_decode as decode
 
     notes: list[str] = []
     for episode in store.pending_capture(limit=budget, min_score=CAPTURE_MIN_SCORE):
         out_dir = store.episode_artifact_dir(int(episode["id"]))
         try:
-            bundle = capture.capture_and_analyse(episode, out_dir, keep_iq=False)
+            bundle = capture.capture_and_analyse(
+                episode, out_dir, keep_iq=False,
+                decode_cb=_live_decoder(int(episode["freq_hz"])),
+            )
         except Exception as exc:
             store.set_decode_status(int(episode["id"]), "failed", str(exc)[:300])
             notes.append(f"ep{episode['id']} capture failed: {exc}")
@@ -368,11 +382,14 @@ def process_captures(env: dict[str, str], budget: int) -> list[str]:
         capture_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"-{episode['freq_hz']}"
         store.add_artifact(int(episode["id"]), "png", bundle["artifacts"][0]["png"],
                            bundle["artifacts"][0]["png_bytes"])
+        stored: list[dict[str, Any]] = [{"kind": "png", "path": bundle["artifacts"][0]["png"]}]
         for mode, info in (bundle.get("audio") or {}).items():
             if info.get("mp3"):
                 store.add_artifact(int(episode["id"]), f"audio-{mode}", info["mp3"], info["mp3_bytes"])
+                stored.append({"kind": f"audio-{mode}", "path": info["mp3"]})
             elif info.get("wav"):
                 store.add_artifact(int(episode["id"]), f"audio-{mode}", info["wav"], info["bytes"])
+                stored.append({"kind": f"audio-{mode}", "path": info["wav"]})
         with store.connect() as conn:
             conn.execute(
                 "UPDATE episodes SET capture_id=?, decode_status='captured', features_json=? WHERE id=?",
@@ -382,6 +399,19 @@ def process_captures(env: dict[str, str], budget: int) -> list[str]:
 
         intel = classify_signal(int(episode["freq_hz"]), {"features": bundle.get("features") or {}})
         store.set_intel(int(episode["id"]), intel)
+
+        # Decode stage: use hits already obtained from full-rate IQ, else run the
+        # audio ladder over the artifacts we just wrote.
+        pre_hits = bundle.get("decode") if isinstance(bundle.get("decode"), list) else None
+        decoded = decode.decode_episode(episode, stored, pre_hits=pre_hits)
+        if decoded["status"] == "decoded":
+            notes.append(
+                f"ep{episode['id']} DECODED {decoded['decode_type']}: "
+                f"{(decoded.get('summary') or '')[:140]}"
+            )
+            LOG.info("decoded ep%s as %s: %s", episode["id"], decoded["decode_type"],
+                     (decoded.get("summary") or "")[:200])
+
         notes.append(
             f"ep{episode['id']} {episode['freq_hz']/1e6:.3f}MHz "
             f"bw={intel.get('features', {}).get('occupied_bandwidth_hz')} "

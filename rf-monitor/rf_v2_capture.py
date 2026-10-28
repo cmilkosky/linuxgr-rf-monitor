@@ -196,8 +196,19 @@ def _fir_lowpass(samples: np.ndarray, sample_rate_hz: float, cutoff_hz: float, t
     return np.convolve(samples, kernel, mode="same").astype(np.float32)
 
 
-def _demodulate(iq: np.ndarray, sample_rate_hz: int, mode: str) -> np.ndarray:
-    """AM envelope / FM discriminator, decimated to 48 kHz, numpy only."""
+def _demodulate(iq: np.ndarray, sample_rate_hz: int, mode: str,
+                offset_hz: float = 0.0) -> np.ndarray:
+    """AM envelope / FM discriminator, decimated to 48 kHz, numpy only.
+
+    `offset_hz` is the tune offset used by the capture (LO minus signal). The
+    capture deliberately tunes off-centre to dodge the DC spike, so without
+    mixing that offset out the 3.5 kHz NFM passband lands 250-600 kHz away from
+    the signal of interest and the audio is the wrong station - or nothing.
+    """
+    if offset_hz:
+        t = np.arange(iq.size, dtype=np.float64)
+        iq = (iq * np.exp(-2j * np.pi * float(offset_hz) * t / float(sample_rate_hz))).astype(np.complex64)
+
     if mode == "am":
         audio = np.abs(iq).astype(np.float32)
         cutoff = 5_000.0
@@ -260,12 +271,13 @@ def _to_mp3(wav_path: Path, mp3_path: Path) -> None:
     )
 
 
-def audio_previews(iq: np.ndarray, sample_rate_hz: int, out_dir: Path) -> dict[str, Any]:
+def audio_previews(iq: np.ndarray, sample_rate_hz: int, out_dir: Path,
+                   offset_hz: float = 0.0) -> dict[str, Any]:
     results: dict[str, Any] = {}
     for mode in ("am", "nfm", "wfm"):
         wav_path = out_dir / f"audio-{mode}.wav"
         try:
-            audio = _demodulate(iq, sample_rate_hz, mode)
+            audio = _demodulate(iq, sample_rate_hz, mode, offset_hz=offset_hz)
             info = write_wav(audio, wav_path)
             info["rms"] = round(float(np.sqrt(np.mean(audio.astype(np.float64) ** 2))), 6)
             mp3_path = out_dir / f"audio-{mode}.mp3"
@@ -298,8 +310,14 @@ def capture_and_analyse(
     out_dir: Path,
     *,
     keep_iq: bool = False,
+    decode_cb=None,
 ) -> dict[str, Any]:
-    """Capture one episode, write spectrogram + audio previews, return the bundle."""
+    """Capture one episode, write spectrogram + audio previews, return the bundle.
+
+    `decode_cb(iq, sample_rate_hz, tune_hz, out_dir)` runs while the samples are
+    still in memory, so the decode stage sees full-rate IQ instead of the 48 kHz
+    audio artifact. Its return value lands in bundle["decode"].
+    """
     from rf_signal_intel import extract_iq_features
 
     frequency_hz = int(episode["freq_hz"])
@@ -332,7 +350,13 @@ def capture_and_analyse(
         features = extract_iq_features(iq, sample_rate_hz, tune_hz)
         bundle["features"] = features
         bundle["artifacts"].append(spectrogram_png(iq, sample_rate_hz, tune_hz, out_dir / "spectrum.png"))
-        bundle["audio"] = audio_previews(iq, sample_rate_hz, out_dir)
+        bundle["audio"] = audio_previews(iq, sample_rate_hz, out_dir,
+                                         offset_hz=float(meta.get("lo_offset_hz") or 0.0))
+        if decode_cb is not None:
+            try:
+                bundle["decode"] = decode_cb(iq, sample_rate_hz, tune_hz, out_dir)
+            except Exception as exc:  # a decoder fault must never lose a capture
+                bundle["decode"] = {"error": str(exc)[:300]}
         bundle["samples"] = int(iq.size)
         bundle["duration_seconds"] = round(iq.size / sample_rate_hz, 3)
         bundle["mean_power_dbfs"] = features.get("mean_power_dbfs")
