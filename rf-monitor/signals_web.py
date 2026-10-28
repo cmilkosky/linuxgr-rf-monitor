@@ -989,8 +989,10 @@ def render_adsb_map() -> str:
     <a href="/adsb/radar" style="color:var(--hot);text-decoration:none">radar view →</a></div></div>
 <iframe id="map" title="tar1090 map" style="width:100%;height:calc(100vh - 150px);min-height:520px;border:1px solid var(--border);border-radius:8px;background:#000"></iframe>
 <script>
-  // same host, port 80 where lighttpd serves tar1090 - works by IP or hostname
-  document.getElementById('map').src = location.protocol + '//' + location.hostname + '/tar1090/';
+  // Same origin on purpose: this app serves tar1090 itself on this port. Port 80 is
+  // not reachable from the LAN (ufw allows only 22/61208/8099), so pointing at
+  // http://<host>/tar1090/ left an empty black frame on every other machine.
+  document.getElementById('map').src = '/tar1090/';
 </script>"""
     return shell("RF Monitor · ADS-B map", body, active="adsb")
 

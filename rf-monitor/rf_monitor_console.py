@@ -20,6 +20,7 @@ from typing import Any
 import requests
 from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from rf_signal_intel import classify_signal, extract_iq_features
 
 
@@ -53,6 +54,19 @@ INFLUX_BUCKET = ENV["INFLUX_BUCKET"]
 INFLUX_TOKEN = ENV["INFLUX_TOKEN"]
 
 app = FastAPI(title="RF Monitor Console")
+
+# tar1090 is served through this app on 8099, not through lighttpd on 80/8504.
+# ufw only allows 22, 61208 and 8099 from the LAN, so the iframe pointing at
+# http://<host>/tar1090/ (port 80) timed out into an empty black box on any other
+# machine. Same-origin also removes cross-port framing from the picture entirely.
+TAR1090_HTML = Path(os.environ.get("TAR1090_HTML", "/usr/local/share/tar1090/html"))
+TAR1090_DATA = Path(os.environ.get("TAR1090_DATA", "/home/cmilkosk/rf-monitor/signals/adsb"))
+if TAR1090_HTML.is_dir():
+    # Register data first: Mount matches by prefix in order, so /tar1090/data/* must
+    # not fall through to the html tree.
+    if TAR1090_DATA.is_dir():
+        app.mount("/tar1090/data", StaticFiles(directory=str(TAR1090_DATA)), name="tar1090-data")
+    app.mount("/tar1090", StaticFiles(directory=str(TAR1090_HTML), html=True), name="tar1090")
 
 
 def flux_query(query: str, timeout: float = 75) -> list[dict[str, str]]:

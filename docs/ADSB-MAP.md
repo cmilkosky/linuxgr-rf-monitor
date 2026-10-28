@@ -99,3 +99,33 @@ sudo curl -sL -o /usr/local/share/tar1090/aircraft.csv.gz \
 
 Photos also need internet from the *browser* (tiles and planespotters both), which is
 why the radar fallback exists.
+
+## Served through the console on 8099, not lighttpd (fixed 2026-10-28)
+
+**Symptom:** `/adsb` showed a large empty black rectangle on any machine other than
+LinuxGR itself, while `aircraft.json` was fresh (0.9 s old, 27 aircraft, 412k messages).
+
+**Cause:** the iframe src was built as `http://<location.hostname>/tar1090/` — port 80.
+lighttpd does serve tar1090 there, but **ufw on LinuxGR allows only 22, 61208 and 8099
+from the LAN**, so port 80 times out from anywhere else and the frame renders black.
+Nothing was wrong with readsb, tar1090, or the JSON.
+
+**Fix:** `rf_monitor_console.py` mounts tar1090 itself, so it rides the port already open:
+
+| Mount | Directory |
+|---|---|
+| `/tar1090/data` | `/home/cmilkosk/rf-monitor/signals/adsb` (aircraft.json, chunks, history) |
+| `/tar1090` | `/usr/local/share/tar1090/html` (index.html + relative assets) |
+
+The data mount is registered **first** — Starlette matches mounts by prefix in order, so
+`/tar1090/data/*` must not fall through to the html tree. The iframe src is now the
+same-origin `'/tar1090/'`.
+
+Verified in a real browser (Chrome over CDP), not just by HTTP status: iframe 1221×520,
+inner document title `tar1090`, 2 canvases, OpenStreetMap tiles drawn, "Total Aircraft: 29
+/ With Position: 24 / Messages: 163.1/sec", sidebar populated with callsigns, types and
+altitudes.
+
+**Do not "fix" this by opening port 80.** Proxying keeps one port open instead of two, and
+same-origin removes cross-port framing from the picture entirely. lighttpd stays installed
+for local use on :80/:8504.
