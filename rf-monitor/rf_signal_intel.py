@@ -229,8 +229,15 @@ def match_signal_candidates(frequency_hz: int, features: dict[str, Any] | None =
         if frequency_match and not broad_generic:
             score += 40
             evidence.append("frequency range matches")
-        elif ref["name"] == "Radar / FMCW sweep candidate" and has_measurements:
+        elif ref["name"] == "Radar / FMCW sweep candidate" and "chirp_like" in traits:
+            # A wide blob is not a chirp. This branch used to fire for ANY frequency that
+            # merely had features (+10) and the radar bandwidth range added another +25,
+            # so any 500 kHz-80 MHz blob scored 35+ with zero sweep evidence - that is how
+            # 593 rows/day were labelled "Radar / FMCW sweep candidate" on width alone.
+            # chirp_like only comes from measured instantaneous-frequency spread
+            # (inst_freq_std > max(50 kHz, 20% of occupied bandwidth)).
             score += 10
+            evidence.append("measured chirp-like instantaneous frequency spread")
         else:
             continue
 

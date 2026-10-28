@@ -190,21 +190,11 @@ def seen_before(freq_hz: int, tolerance_hz: int, before_iso: str) -> bool:
     return row is not None
 
 
-def match_open_episode(
-    low_hz: int, high_hz: int, tolerance_hz: int = 1_500_000, min_overlap: float = 0.25
-) -> sqlite3.Row | None:
-    """Match on spectral overlap, not centre distance.
+REOPEN_HOURS = float(os.environ.get("RF_SIGNALS_REOPEN_HOURS", "6"))
 
-    A wide emitter's estimated centre wanders a few MHz between scans (Wi-Fi at
-    2459 vs 2461 MHz), so a centre-distance test spawns a duplicate row every few
-    minutes. Overlap matching keeps one row per real emitter.
-    """
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM episodes WHERE state='open' AND high_hz >= ? AND low_hz <= ? "
-            "ORDER BY last_seen DESC",
-            (int(low_hz) - int(tolerance_hz), int(high_hz) + int(tolerance_hz)),
-        ).fetchall()
+
+def _best_overlap(rows: list[sqlite3.Row], low_hz: int, high_hz: int,
+                  min_overlap: float) -> sqlite3.Row | None:
     best: sqlite3.Row | None = None
     best_fraction = 0.0
     for row in rows:
@@ -218,10 +208,60 @@ def match_open_episode(
     return best if best_fraction >= min_overlap else None
 
 
+def match_episode(
+    low_hz: int, high_hz: int, tolerance_hz: int = 1_500_000, min_overlap: float = 0.25,
+    *, open_only: bool = True, since_iso: str | None = None,
+) -> sqlite3.Row | None:
+    sql = "SELECT * FROM episodes WHERE high_hz >= ? AND low_hz <= ?"
+    params: list[Any] = [int(low_hz) - int(tolerance_hz), int(high_hz) + int(tolerance_hz)]
+    if open_only:
+        sql += " AND state='open'"
+    if since_iso:
+        sql += " AND last_seen >= ?"
+        params.append(since_iso)
+    sql += " ORDER BY last_seen DESC"
+    with connect() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return _best_overlap(rows, low_hz, high_hz, min_overlap)
+
+
+def match_open_episode(
+    low_hz: int, high_hz: int, tolerance_hz: int = 1_500_000, min_overlap: float = 0.25
+) -> sqlite3.Row | None:
+    """Match on spectral overlap, not centre distance.
+
+    A wide emitter's estimated centre wanders a few MHz between scans (Wi-Fi at
+    2459 vs 2461 MHz), so a centre-distance test spawns a duplicate row every few
+    minutes. Overlap matching keeps one row per real emitter.
+    """
+    return match_episode(low_hz, high_hz, tolerance_hz, min_overlap, open_only=True)
+
+
+def match_recent_episode(
+    low_hz: int, high_hz: int, tolerance_hz: int = 1_500_000, min_overlap: float = 0.25,
+    hours: float = REOPEN_HOURS,
+) -> sqlite3.Row | None:
+    """Match an episode seen within `hours`, whether it is open or closed.
+
+    Why: close_stale() closes an episode after 15 min without a sighting, and the insert
+    path then made a NEW row when the emitter returned. That - not transient blips - is
+    where ~1,872 episodes/day came from while the journal showed new=0 updated=8 per
+    cycle. Reopening the recent row keeps one row per emitter per day instead of one per
+    15-minute window.
+    """
+    cutoff = to_iso(datetime.now(timezone.utc) - timedelta(hours=hours))
+    return match_episode(low_hz, high_hz, tolerance_hz, min_overlap,
+                         open_only=False, since_iso=cutoff)
+
+
 def upsert_blob(blob: dict[str, Any], tolerance_hz: int, stale_minutes: int = 15) -> dict[str, Any]:
     """Create or refresh the episode for a detected blob. Returns a small result dict."""
     now = utcnow()
     match = match_open_episode(blob["low_hz"], blob["high_hz"], tolerance_hz)
+    if match is None:
+        # Reopen a recently-seen episode instead of minting a duplicate row after the
+        # 15-minute stale close.
+        match = match_recent_episode(blob["low_hz"], blob["high_hz"], tolerance_hz)
     if match is not None:
         episode_id = int(match["id"])
         peak_snr = max(float(match["peak_snr_db"]), float(blob["peak_snr_db"]))
@@ -472,6 +512,7 @@ def query_episodes(
     seen_before: str | None = None,
     min_snr: float | None = None,
     decoded_only: bool = False,
+    exclude_source: str | None = None,
     search: str | None = None,
     sort: str = "time",
     direction: str = "desc",
@@ -483,6 +524,11 @@ def query_episodes(
     if section == "strongest":
         where.append("last_seen >= ?")
         params.append(local_day_start_utc(0))
+    if exclude_source:
+        # ADS-B aircraft have their own page. 1,203 aircraft episodes/day crowded
+        # the signal list so badly that nothing else was readable.
+        where.append("(source IS NULL OR source != ?)")
+        params.append(exclude_source)
     if decode_type:
         where.append("decode_type = ?")
         params.append(decode_type)
@@ -539,23 +585,34 @@ def count_episodes(**kwargs: Any) -> int:
     return len(query_episodes(**kwargs))
 
 
-def dashboard_counts() -> dict[str, Any]:
+def dashboard_counts(exclude_source: str | None = None) -> dict[str, Any]:
+    """Counts for the Signals strip.
+
+    exclude_source keeps the headline numbers consistent with the list beneath them -
+    otherwise the strip counts ADS-B aircraft that the list deliberately hides.
+    """
     today = local_day_start_utc(0)
+    src = " AND (source IS NULL OR source != ?)" if exclude_source else ""
+    params: tuple[Any, ...] = (today,) + ((exclude_source,) if exclude_source else ())
     with connect() as conn:
-        total = conn.execute("SELECT COUNT(*) FROM episodes WHERE last_seen >= ?", (today,)).fetchone()[0]
-        new = conn.execute("SELECT COUNT(*) FROM episodes WHERE last_seen >= ? AND is_new=1", (today,)).fetchone()[0]
+        total = conn.execute(
+            "SELECT COUNT(*) FROM episodes WHERE last_seen >= ?" + src, params).fetchone()[0]
+        new = conn.execute(
+            "SELECT COUNT(*) FROM episodes WHERE last_seen >= ? AND is_new=1" + src, params).fetchone()[0]
         decoded = conn.execute(
-            "SELECT COUNT(*) FROM episodes WHERE last_seen >= ? AND decode_status='decoded'", (today,)
-        ).fetchone()[0]
+            "SELECT COUNT(*) FROM episodes WHERE last_seen >= ? AND decode_status='decoded'" + src,
+            params).fetchone()[0]
         by_type = {
             row[0]: row[1]
             for row in conn.execute(
                 "SELECT decode_type, COUNT(*) FROM episodes WHERE last_seen >= ? AND decode_type IS NOT NULL"
-                " GROUP BY decode_type",
-                (today,),
+                + src + " GROUP BY decode_type",
+                params,
             ).fetchall()
         }
-        last = conn.execute("SELECT MAX(last_seen) FROM episodes").fetchone()[0]
+        last_params: tuple[Any, ...] = (exclude_source,) if exclude_source else ()
+        last = conn.execute(
+            "SELECT MAX(last_seen) FROM episodes WHERE 1=1" + src, last_params).fetchone()[0]
     return {
         "today_total": total,
         "today_new": new,

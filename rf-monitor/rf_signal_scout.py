@@ -53,6 +53,67 @@ MAX_CAPTURES_PER_RUN = int(os.environ.get("RF_SCOUT_MAX_CAPTURES", "3"))
 CAPTURE_MIN_SCORE = float(os.environ.get("RF_SCOUT_CAPTURE_MIN_SCORE", "45"))
 CAPTURES_PER_HOUR = int(os.environ.get("RF_SCOUT_CAPTURES_PER_HOUR", "60"))
 RETENTION_EVERY_SECONDS = int(os.environ.get("RF_SCOUT_RETENTION_EVERY", "600"))
+# Persistence gate. A single 60 s sweep of noise always produces peaks, so one sweep is
+# not evidence. A blob must appear in CONFIRM_SWEEPS consecutive sweeps before it becomes
+# an episode - unless it is strong enough that its strength alone is the evidence.
+CONFIRM_SWEEPS = int(os.environ.get("RF_SCOUT_CONFIRM_SWEEPS", "2"))
+CONFIRM_SNR_BYPASS = float(os.environ.get("RF_SCOUT_CONFIRM_SNR_BYPASS", "25.0"))
+PENDING_PATH = Path(os.environ.get("RF_SCOUT_PENDING",
+                                   "/home/cmilkosk/rf-monitor/scout-pending.json"))
+PENDING_MAX_AGE_S = float(os.environ.get("RF_SCOUT_PENDING_MAX_AGE", "600"))
+
+
+def _load_pending() -> list[dict[str, Any]]:
+    try:
+        data = json.loads(PENDING_PATH.read_text())
+    except (OSError, ValueError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _save_pending(items: list[dict[str, Any]]) -> None:
+    tmp = PENDING_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(items))
+    tmp.replace(PENDING_PATH)
+
+
+def confirm_blobs(blobs: list[dict[str, Any]], previous: list[dict[str, Any]],
+                  *, tolerance_hz: int = MATCH_HZ, now: float | None = None
+                  ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split detections into (confirmed, still-pending).
+
+    Measured 2026-10-28: 1,874 sweep episodes/day against a 15-25/day design target, and
+    874 of them were seen once and never again. The list was a noise log. A blob now needs
+    a matching detection in the previous sweep (CONFIRM_SWEEPS sweeps total), or a peak
+    SNR of CONFIRM_SNR_BYPASS dB where strength alone is unambiguous.
+    """
+    now = time.time() if now is None else now
+    prev = [dict(item) for item in previous
+            if now - float(item.get("last_seen_epoch") or 0) <= PENDING_MAX_AGE_S]
+    remaining = list(range(len(prev)))
+    confirmed: list[dict[str, Any]] = []
+    carried: list[dict[str, Any]] = []
+    for blob in blobs:
+        if float(blob["peak_snr_db"]) >= CONFIRM_SNR_BYPASS:
+            confirmed.append(blob)
+            continue
+        hit = next((idx for idx in remaining
+                    if abs(float(prev[idx]["freq_hz"]) - float(blob["freq_hz"])) <= tolerance_hz),
+                   None)
+        if hit is None:
+            carried.append({
+                "freq_hz": int(blob["freq_hz"]), "low_hz": int(blob["low_hz"]),
+                "high_hz": int(blob["high_hz"]), "peak_snr_db": float(blob["peak_snr_db"]),
+                "sweeps": 1, "last_seen_epoch": now,
+            })
+            continue
+        remaining.remove(hit)
+        sweeps = int(prev[hit].get("sweeps") or 1) + 1
+        if sweeps >= CONFIRM_SWEEPS:
+            confirmed.append(blob)
+        else:
+            carried.append({**prev[hit], "sweeps": sweeps, "last_seen_epoch": now})
+    return confirmed, carried
 
 # Bands where a real signal is expected. "known" only affects whether the row
 # competes in the unexplained feed - it does not stop the row existing, because
@@ -431,7 +492,14 @@ def run_once(env: dict[str, str], *, dry_run: bool = False, capture_budget: int 
         LOG.warning("no sweep data returned (floor=%s recent=%s)", len(floor), len(recent))
         return {"blobs": 0, "created": 0, "updated": 0, "captures": [], "seconds": 0.0}
 
-    blobs = detect_blobs(floor, recent)
+    detected = detect_blobs(floor, recent)
+    previous = _load_pending()
+    blobs, pending = confirm_blobs(detected, previous)
+    # Saved even in dry-run: the pending window IS the thing being tested, and a dry-run
+    # that forgot what it saw would confirm nothing and measure nothing.
+    _save_pending(pending)
+    LOG.info("confirm: %d detected -> %d confirmed, %d pending",
+             len(detected), len(blobs), len(pending))
     created = updated = skipped = 0
     for blob in blobs:
         known = known_band(blob["freq_hz"])

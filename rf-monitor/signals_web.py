@@ -29,6 +29,10 @@ import rf_watchlist
 router = APIRouter()
 LOCAL_TZ = ZoneInfo("America/New_York")
 
+# ADS-B aircraft have their own page. Left in the signal list they are 1,203 episodes a
+# day - 39% of every row - which buried the signals this app exists to show.
+EXCLUDED_SOURCE = "adsb-lane"
+
 TYPE_SECTIONS: list[tuple[str, str, tuple[str, ...]]] = [
     ("voice", "VOICE", ("voice",)),
     ("music", "MUSIC", ("music",)),
@@ -306,15 +310,18 @@ def storage_text() -> str:
 
 
 def render_dashboard() -> str:
-    counts = store.dashboard_counts()
-    strongest = store.query_episodes(section="strongest", limit=10, sort="snr", direction="desc")
-    latest = store.query_episodes(section="latest", limit=50, sort="time", direction="desc")
+    counts = store.dashboard_counts(exclude_source=EXCLUDED_SOURCE)
+    strongest = store.query_episodes(section="strongest", limit=10, sort="snr", direction="desc",
+                                     exclude_source=EXCLUDED_SOURCE)
+    latest = store.query_episodes(section="latest", limit=50, sort="time", direction="desc",
+                                  exclude_source=EXCLUDED_SOURCE)
 
     blocks = [section_block("STRONGEST SIGNALS (TODAY, BY SNR)", strongest,
                             section_key="strongest",
                             empty_note="Nothing above the noise floor yet today.")]
     for key, title, types in TYPE_SECTIONS:
-        rows = store.query_episodes(decode_types=list(types), limit=20, sort="time", direction="desc")
+        rows = store.query_episodes(decode_types=list(types), limit=20, sort="time", direction="desc",
+                                    exclude_source=EXCLUDED_SOURCE)
         blocks.append(section_block(title, rows, section_key=key,
                                     empty_note=f"No {title.lower()} decoded yet — decoder lands in the next phase."))
     blocks.append(section_block("LATEST (50)", latest, section_key="latest",
@@ -328,6 +335,9 @@ def render_dashboard() -> str:
   <div class="stat"><strong>{counts['today_decoded']}</strong><span>decoded today</span></div>
   <div class="stat"><strong>{storage_text()}</strong><span>sample storage (cap {store.CAP_BYTES/1024**3:,.1f} GB)</span></div>
   <div class="stat"><strong style="font-size:13px">{esc(last_scan)}</strong><span>last scan (ET)</span></div>
+</div>
+<div class="muted" style="margin:-4px 0 14px;font-size:12px">
+  ADS-B aircraft are not in this list — they live on the <a href="/adsb" style="color:var(--hot);text-decoration:none">ADS-B page</a>.
 </div>"""
     return shell("RF Monitor · Signals", strip + "".join(blocks), active="signals", refresh=60)
 
@@ -390,6 +400,7 @@ def render_table(
     sort: str, direction: str, limit: int, offset: int,
 ) -> str:
     kwargs = _filter_args(section, decode_type, klass, band, fmin, fmax, dt_from, dt_to, min_snr, decoded, search)
+    kwargs["exclude_source"] = EXCLUDED_SOURCE
     rows = store.query_episodes(**kwargs, sort=sort, direction=direction, limit=limit, offset=offset)
     total = store.count_episodes(**kwargs)
 
@@ -640,6 +651,7 @@ def signals_export(
     direction: str = Query("desc"),
 ) -> Response:
     kwargs = _filter_args(section, decode_type, klass, band, fmin, fmax, dt_from, dt_to, min_snr, decoded, search)
+    kwargs["exclude_source"] = EXCLUDED_SOURCE
     rows = store.query_episodes(**kwargs, sort=sort, direction=direction, limit=250, offset=0)
     buffer = io.StringIO()
     writer = csv.writer(buffer)

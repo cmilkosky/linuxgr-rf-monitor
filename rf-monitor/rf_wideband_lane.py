@@ -44,6 +44,10 @@ from rf_v2_capture import PORTAPACK_LOCK_PATH, capture_hackrf, read_iq, remove_d
 
 DWELL_SECONDS = float(os.environ.get("RF_WIDEBAND_DWELL_SECONDS", "6"))
 MIN_SNR_DB = float(os.environ.get("RF_WIDEBAND_MIN_SNR", "8"))
+# Bandwidth over which channel power is averaged for the gate. 1 kHz suits NBFM (weather,
+# pager, APRS): narrow enough that empty skirts don't dilute the carrier, wide enough
+# (~33 bins at 2 MS/s) that one hot bin cannot masquerade as a signal.
+TOP_BANDWIDTH_HZ = float(os.environ.get("RF_WIDEBAND_TOP_BW_HZ", "1000"))
 INTERVAL = float(os.environ.get("RF_WIDEBAND_INTERVAL", "300"))
 DEVICE_SERIAL = os.environ.get("RF_WIDEBAND_DEVICE_SERIAL", "").strip()
 ENABLED_BANDS = os.environ.get("RF_WIDEBAND_BANDS", "vhf-144,wx-162,pager-929")
@@ -130,7 +134,8 @@ def channel_snr(iq: np.ndarray, sample_rate_hz: int, center_hz: int,
         psd += np.abs(np.fft.fft(chunk * window)) ** 2
         used += 1
     if not used:
-        return [{"freq_hz": c["freq_hz"], "label": c["label"], "snr_db": 0.0, "carrier": False} for c in channels]
+        return [{"freq_hz": c["freq_hz"], "label": c["label"], "snr_db": 0.0,
+                 "peak_snr_db": 0.0, "carrier": False} for c in channels]
     psd /= used
     bin_hz = float(sample_rate_hz) / seg
     half_bins = max(1, int(round(half_width_hz / bin_hz)))
@@ -144,11 +149,24 @@ def channel_snr(iq: np.ndarray, sample_rate_hz: int, center_hz: int,
         centre_index = floor_bins
         keep[max(0, centre_index - half_bins):centre_index + half_bins + 1] = False
         floor = float(np.median(psd[near[keep]])) or 1e-12
-        peak = float(psd[near[centre_index - half_bins:centre_index + half_bins + 1]].max())
-        snr = 10.0 * np.log10(max(peak, 1e-12) / floor)
+        window_bins = psd[near[centre_index - half_bins:centre_index + half_bins + 1]]
+        peak = float(window_bins.max())
+        peak_snr = 10.0 * np.log10(max(peak, 1e-12) / floor)
+        # Gate on the mean power of the OCCUPIED bandwidth, not the best single bin and not
+        # the whole 6 kHz window. Measured on one 162.5 MHz capture (2026-10-28):
+        #   peak        noise 4.9/5.2 dB   WX7 27.0 dB   -> 10 dB of free SNR for noise
+        #   mean all    noise 0.5/-0.3 dB  WX7  7.6 dB   -> real station falls under the gate
+        #   mean top1k  noise 3.1/2.6 dB   WX7 16.2 dB   -> 13 dB of separation
+        # The window mean is diluted by the empty skirts of a narrowband carrier; the top
+        # 1 kHz is where an NBFM station's power actually is, and averaging 30+ bins keeps
+        # a single-bin spur from reading as a carrier.
+        n_top = max(1, int(round(TOP_BANDWIDTH_HZ / bin_hz)))
+        occupied = float(np.sort(window_bins)[-n_top:].mean())
+        snr = 10.0 * np.log10(max(occupied, 1e-12) / floor)
         report.append({
             "freq_hz": channel["freq_hz"], "label": channel["label"],
-            "snr_db": round(float(snr), 1), "carrier": bool(snr >= MIN_SNR_DB),
+            "snr_db": round(float(snr), 1), "peak_snr_db": round(float(peak_snr), 1),
+            "carrier": bool(snr >= MIN_SNR_DB),
         })
     return report
 
@@ -240,7 +258,7 @@ def _record_hits(band: dict[str, Any], channel: dict[str, Any], entry: dict[str,
             "low_hz": int(channel["freq_hz"]) - 6_000,
             "high_hz": int(channel["freq_hz"]) + 6_000,
             "n_bins": 1,
-            "peak_snr_db": float(entry["snr_db"]),
+            "peak_snr_db": float(entry.get("peak_snr_db", entry["snr_db"])),
             "mean_snr_db": max(0.0, float(entry["snr_db"]) - 3.0),
             "peak_rssi_db": float(entry["snr_db"]),
             "floor_db": 0.0,
