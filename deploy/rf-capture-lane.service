@@ -1,0 +1,20 @@
+[Unit]
+Description=RF Monitor capture lane (PortaPack in HackRF mode, pinned by serial)
+StartLimitIntervalSec=0
+Documentation=https://github.com/cmilkosky/linuxgr-rf-monitor
+After=network.target
+
+[Service]
+Type=simple
+User=cmilkosk
+Group=cmilkosk
+Environment=RF_SIGNALS_DIR=/home/cmilkosk/rf-monitor/signals
+# Mode 600, cmilkosk-owned: holds RF_CAPTURE_DEVICE_SERIAL.
+EnvironmentFile=/home/cmilkosk/.config/rf-capture-lane.env
+ExecStart=/usr/bin/python3 /home/cmilkosk/rf-monitor/rf_capture_lane.py --loop
+Restart=always
+RestartSec=15
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

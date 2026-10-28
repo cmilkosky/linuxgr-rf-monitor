@@ -1,5 +1,6 @@
 [Unit]
 Description=RF Monitor ADS-B lane (dump1090 aircraft.json -> episode rows)
+StartLimitIntervalSec=0
 Documentation=https://github.com/cmilkosky/linuxgr-rf-monitor
 After=rf-adsb-dump1090.service
 Wants=rf-adsb-dump1090.service
@@ -12,7 +13,6 @@ Environment=RF_SIGNALS_DIR=/home/cmilkosk/rf-monitor/signals
 ExecStart=/usr/bin/python3 /home/cmilkosk/rf-monitor/rf_adsb_lane.py --loop --interval 5
 Restart=always
 RestartSec=10
-StartLimitIntervalSec=0
 
 [Install]
 WantedBy=multi-user.target

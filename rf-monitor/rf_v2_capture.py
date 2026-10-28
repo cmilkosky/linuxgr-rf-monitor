@@ -16,7 +16,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 import numpy as np
 
@@ -33,13 +33,20 @@ VGA_GAIN_DB = int(os.environ.get("RF_VGA_GAIN_DB", "24"))
 AMP_ENABLE = int(os.environ.get("RF_AMP_ENABLE", "0"))
 LO_OFFSET_NARROW_HZ = int(os.environ.get("RF_LO_OFFSET_NARROW_HZ", "250000"))
 LO_OFFSET_WIDE_HZ = int(os.environ.get("RF_LO_OFFSET_WIDE_HZ", "600000"))
+# The PortaPack's own leakage lands here; a capture on those frequencies would be
+# the radio hearing itself. Half-width is deliberately generous (150 kHz).
+SPUR_MASK_HZ: tuple[int, ...] = (89_000_000, 101_500_000)
+SPUR_HALF_WIDTH_HZ = int(os.environ.get("RF_SPUR_HALF_WIDTH_HZ", "150000"))
+# Separate flock for the second radio so a capture never waits on a sweep.
+PORTAPACK_LOCK_PATH = Path(os.environ.get("RF_PORTAPACK_LOCK", "/tmp/rf-portapack-device.lock"))
 
 
 @contextmanager
-def device_lock(timeout_seconds: float = 120.0) -> Iterator[None]:
-    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+def device_lock(timeout_seconds: float = 120.0, path: Path | None = None) -> Iterator[None]:
+    lock_path = Path(path) if path is not None else LOCK_PATH
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + timeout_seconds
-    with open(LOCK_PATH, "w") as handle:
+    with open(lock_path, "w") as handle:
         while True:
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -67,8 +74,17 @@ def capture_hackrf(
     lna_gain_db: int = LNA_GAIN_DB,
     vga_gain_db: int = VGA_GAIN_DB,
     amp_enable: int = AMP_ENABLE,
+    device_serial: str | None = None,
+    lock_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Grab one IQ capture from the HackRF. Caller owns the returned meta."""
+    """Grab one IQ capture from a HackRF. Caller owns the returned meta.
+
+    `device_serial` pins the radio. With two HackRFs attached (main + PortaPack)
+    an unpinned capture gets whichever enumerated first, which is how a capture
+    lane and the sweep end up fighting over one radio. `lock_path` picks the
+    flock: the main radio shares `RF_HACKRF_LOCK` with the sweep, the PortaPack
+    has its own so captures never wait on a sweep.
+    """
     out_iq.parent.mkdir(parents=True, exist_ok=True)
     sample_count = int(duration_seconds * sample_rate_hz)
     command = [
@@ -81,8 +97,10 @@ def capture_hackrf(
         "-l", str(int(lna_gain_db)),
         "-g", str(int(vga_gain_db)),
     ]
+    if device_serial:
+        command += ["-d", str(device_serial)]
     started = datetime.now(timezone.utc)
-    with device_lock(timeout_seconds=duration_seconds + 120):
+    with device_lock(timeout_seconds=duration_seconds + 120, path=lock_path):
         result = subprocess.run(
             command, capture_output=True, text=True, timeout=duration_seconds + 30
         )
@@ -305,22 +323,54 @@ GAIN_LADDER: tuple[tuple[int, int], ...] = (
 OVERLOAD_P99 = float(os.environ.get("RF_OVERLOAD_P99", "0.80"))
 
 
+class SpurMaskedError(RuntimeError):
+    """Target frequency sits inside the receiver's own spur mask."""
+
+
+def signal_present(samples, min_db: float = 12.0) -> bool:
+    """Cheap 'is something still there' test used for extend-on-progress."""
+    seg = np.asarray(samples, dtype=np.complex64)
+    if seg.size < 4096:
+        return False
+    window = seg[: (seg.size // 4096) * 4096].reshape(-1, 4096)
+    spec = np.abs(np.fft.fftshift(np.fft.fft(window, axis=1))).mean(axis=0)
+    db = 20.0 * np.log10(np.where(spec > 0, spec, 1e-12))
+    return bool(db.max() - np.median(db) >= min_db)
+
+
 def capture_and_analyse(
     episode: dict[str, Any],
     out_dir: Path,
     *,
     keep_iq: bool = False,
     decode_cb=None,
+    duration_seconds: float | None = None,
+    max_duration_seconds: float | None = None,
+    device_serial: str | None = None,
+    lock_path: Path | None = None,
+    spur_mask_hz: Iterable[int] = (),
 ) -> dict[str, Any]:
     """Capture one episode, write spectrogram + audio previews, return the bundle.
 
     `decode_cb(iq, sample_rate_hz, tune_hz, out_dir)` runs while the samples are
     still in memory, so the decode stage sees full-rate IQ instead of the 48 kHz
     audio artifact. Its return value lands in bundle["decode"].
+
+    `max_duration_seconds` > `duration_seconds` turns on extend-on-progress: the
+    capture keeps adding chunks while the signal is still on the air, which is
+    what a 4 s grab cannot do for a slow beacon or a data burst that starts late.
+    `spur_mask_hz` refuses frequencies where the receiver's own leakage would be
+    mistaken for a signal (the PortaPack spurs at ~89.0 and ~101.5 MHz).
     """
     from rf_signal_intel import extract_iq_features
 
     frequency_hz = int(episode["freq_hz"])
+    for spur in spur_mask_hz or ():
+        if abs(frequency_hz - int(spur)) <= SPUR_HALF_WIDTH_HZ:
+            raise SpurMaskedError(
+                f"{frequency_hz / 1e6:.3f} MHz is within {SPUR_HALF_WIDTH_HZ // 1000} kHz of the "
+                f"{int(spur) / 1e6:.1f} MHz receiver spur - not capturable on this radio"
+            )
     sample_rate_hz = choose_sample_rate(int(episode.get("bandwidth_hz") or 1_000_000))
     # Tune off-centre so the signal of interest is never sitting on the DC spike.
     offset_hz = LO_OFFSET_WIDE_HZ if sample_rate_hz >= WIDE_RATE_HZ else LO_OFFSET_NARROW_HZ
@@ -330,19 +380,56 @@ def capture_and_analyse(
     out_dir.mkdir(parents=True, exist_ok=True)
     iq_path = out_dir / "capture.iq"
 
-    # Capture, then back off the gain if the front end is anywhere near full scale.
-    iq = None
+    base_seconds = float(duration_seconds or CAPTURE_SECONDS)
+    max_seconds = max(base_seconds, float(max_duration_seconds or base_seconds))
+
+    # First chunk doubles as gain selection: step down while the front end is
+    # anywhere near full scale.
+    parts: list[Path] = []
     meta: dict[str, Any] = {}
-    for lna, vga in GAIN_LADDER:
-        meta = capture_hackrf(tune_hz, iq_path, sample_rate_hz=sample_rate_hz,
-                              lna_gain_db=lna, vga_gain_db=vga)
-        iq = remove_dc(read_iq(iq_path))
-        p99 = float(np.percentile(np.abs(iq), 99))
-        meta["p99_amplitude"] = round(p99, 4)
-        if p99 <= OVERLOAD_P99:
+    gains = GAIN_LADDER[0]
+    first_p99: float | None = None
+    for attempt, (lna, vga) in enumerate(GAIN_LADDER):
+        part = out_dir / f"capture.part{attempt}.iq"
+        meta = capture_hackrf(tune_hz, part, duration_seconds=base_seconds,
+                              sample_rate_hz=sample_rate_hz, lna_gain_db=lna, vga_gain_db=vga,
+                              device_serial=device_serial, lock_path=lock_path)
+        chunk_iq = remove_dc(read_iq(part))
+        p99 = float(np.percentile(np.abs(chunk_iq), 99))
+        first_p99 = p99
+        if p99 <= OVERLOAD_P99 or attempt == len(GAIN_LADDER) - 1:
+            gains = (lna, vga)
+            parts.append(part)
             break
         print(f"overload p99={p99:.2f} at lna={lna}/vga={vga}; stepping gain down", flush=True)
-    assert iq is not None
+        part.unlink(missing_ok=True)
+
+    # Extend-on-progress: keep dwelling while the signal keeps showing up.
+    captured_seconds = base_seconds
+    while captured_seconds + base_seconds <= max_seconds:
+        tail = remove_dc(read_iq(parts[-1]))[-int(sample_rate_hz * 2):]
+        if not signal_present(tail):
+            break
+        part = out_dir / f"capture.part{len(parts)}.iq"
+        meta = capture_hackrf(tune_hz, part, duration_seconds=base_seconds,
+                              sample_rate_hz=sample_rate_hz, lna_gain_db=gains[0],
+                              vga_gain_db=gains[1], device_serial=device_serial, lock_path=lock_path)
+        parts.append(part)
+        captured_seconds += base_seconds
+
+    if len(parts) == 1:
+        parts[0].replace(iq_path)
+    else:
+        with open(iq_path, "wb") as handle:
+            for part in parts:
+                handle.write(part.read_bytes())
+                part.unlink(missing_ok=True)
+    iq = remove_dc(read_iq(iq_path))
+    meta["dwell_seconds"] = round(captured_seconds, 2)
+    # The extend loop replaces `meta` with the last chunk's, so the first chunk's
+    # overload measurement and the gains that survived are re-applied here.
+    meta["p99_amplitude"] = round(first_p99, 4) if first_p99 is not None else None
+    meta["gains"] = {"lna_db": gains[0], "vga_db": gains[1]}
     meta["target_hz"] = frequency_hz
     meta["lo_offset_hz"] = tune_hz - frequency_hz
     bundle: dict[str, Any] = {"capture": meta, "artifacts": []}

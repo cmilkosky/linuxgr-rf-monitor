@@ -1,5 +1,6 @@
 [Unit]
 Description=RF Monitor ADS-B demodulator (dump1090, 1090 MHz, dedicated RTL)
+StartLimitIntervalSec=0
 Documentation=https://github.com/cmilkosky/linuxgr-rf-monitor
 After=network.target
 
@@ -13,7 +14,6 @@ ExecStart=/usr/bin/dump1090-mutability --device-index 0 --write-json /home/cmilk
 Restart=always
 RestartSec=5
 # Give the RTL a moment to enumerate after a reboot before the first open fails.
-StartLimitIntervalSec=0
 Nice=-5
 
 [Install]
