@@ -12,8 +12,9 @@ import csv
 import html
 import io
 import json
+import math
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
@@ -209,6 +210,7 @@ def shell(title: str, body: str, *, active: str = "signals", refresh: int = 0) -
     {nav_item("signals", "/", "Signals")}
     {nav_item("spectrum", "/spectrum", "Spectrum")}
     {nav_item("watchlist", "/watchlist", "Watchlist")}
+    {nav_item("adsb", "/adsb", "ADS-B")}
     {nav_item("health", "/ha-radio-health", "Radio Health")}
   </nav>
 </header>
@@ -780,6 +782,193 @@ def watchlist_remove(entry_id: int) -> RedirectResponse:
         raise HTTPException(404, "no such watchlist entry")
     rf_watchlist.remove_entry(int(entry_id))
     return RedirectResponse("/watchlist?" + urlencode({"message": f"removed {entry.get('label')}"}), status_code=303)
+
+
+# --------------------------------------------------------------------------- #
+# ADS-B page: aircraft on a radar plot, from dump1090's own JSON
+# --------------------------------------------------------------------------- #
+ADSB_JSON = Path(os.environ.get("RF_ADSB_JSON", "/home/cmilkosk/rf-monitor/signals/adsb/aircraft.json"))
+SITE_CONFIG = Path(os.environ.get("RF_SITE_CONFIG", str(Path.home() / ".config" / "rf-site.json")))
+
+
+def site_coords() -> dict[str, float] | None:
+    """Receiver position, kept in a 0600 file outside the repo (never committed)."""
+    try:
+        data = json.loads(SITE_CONFIG.read_text())
+        return {"latitude": float(data["latitude"]), "longitude": float(data["longitude"])}
+    except Exception:
+        return None
+
+
+def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dlambda = math.radians(lon2 - lon1)
+    y = math.sin(dlambda) * math.cos(phi2)
+    x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlambda)
+    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+
+def _distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    radius = 6371.0088
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = phi2 - phi1
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * radius * math.asin(math.sqrt(a))
+
+
+def adsb_snapshot() -> dict[str, Any]:
+    site = site_coords()
+    try:
+        payload = json.loads(ADSB_JSON.read_text())
+    except Exception as exc:
+        return {"ok": False, "error": f"aircraft.json unreadable: {exc}", "aircraft": []}
+    aircraft = []
+    for entry in payload.get("aircraft", []):
+        if not isinstance(entry, dict):
+            continue
+        row = {
+            "hex": entry.get("hex"),
+            "flight": (entry.get("flight") or "").strip(),
+            "altitude": entry.get("altitude") or entry.get("alt_baro"),
+            "ground_speed": entry.get("ground_speed"),
+            "track": entry.get("track"),
+            "squawk": entry.get("squawk"),
+            "seen": entry.get("seen"),
+            "lat": entry.get("lat"),
+            "lon": entry.get("lon"),
+        }
+        if site and isinstance(row["lat"], (int, float)) and isinstance(row["lon"], (int, float)):
+            row["distance_km"] = round(_distance_km(site["latitude"], site["longitude"], row["lat"], row["lon"]), 1)
+            row["bearing_deg"] = round(_bearing_deg(site["latitude"], site["longitude"], row["lat"], row["lon"]), 1)
+        aircraft.append(row)
+    positioned = [a for a in aircraft if a.get("distance_km") is not None]
+    return {
+        "ok": True,
+        "site": bool(site),
+        "generated": utcnow_stamp(),
+        "messages": payload.get("messages"),
+        "count": len(aircraft),
+        "positioned": len(positioned),
+        "max_range_km": max((a["distance_km"] for a in positioned), default=0.0),
+        "aircraft": aircraft,
+    }
+
+
+def utcnow_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@router.get("/api/adsb/live")
+def api_adsb_live() -> JSONResponse:
+    return JSONResponse(adsb_snapshot())
+
+
+def render_adsb() -> str:
+    body = """
+<div class="blockHead"><h2>ADS-B · 1090 MHz</h2><div class="meta" id="stamp">loading…</div></div>
+<div class="panel" id="notice" style="display:none"></div>
+<div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start">
+  <div class="panel" style="flex:0 0 auto">
+    <canvas id="radar" width="720" height="720" style="max-width:100%;height:auto"></canvas>
+    <div class="muted" style="font-size:12.5px;margin-top:6px">North up · rings at 25/50/100/200 km · dot size = altitude · label = callsign</div>
+  </div>
+  <div class="panel" style="flex:1 1 380px;min-width:320px">
+    <h3>Aircraft</h3>
+    <div style="max-height:660px;overflow:auto">
+      <table><thead><tr><th>Flight</th><th>Hex</th><th>Alt</th><th>GS</th><th>Dist</th><th>Brg</th></tr></thead>
+      <tbody id="rows"></tbody></table>
+    </div>
+  </div>
+</div>
+<script>
+const RINGS = [25, 50, 100, 200];
+let scaleMax = 100;
+
+function draw(data) {
+  const c = document.getElementById('radar');
+  const ctx = c.getContext('2d');
+  const W = c.width, H = c.height, cx = W / 2, cy = H / 2;
+  const cs = getComputedStyle(document.documentElement);
+  const fg = (cs.getPropertyValue('--foreground') || '#ddd').trim();
+  const muted = (cs.getPropertyValue('--muted-foreground') || '#888').trim();
+  const accent = (cs.getPropertyValue('--accent') || '#3fa9f5').trim();
+  const border = (cs.getPropertyValue('--border') || '#444').trim();
+  ctx.clearRect(0, 0, W, H);
+
+  const positioned = data.aircraft.filter(a => a.distance_km != null);
+  const maxSeen = positioned.reduce((m, a) => Math.max(m, a.distance_km), 0);
+  scaleMax = Math.max(50, Math.min(200, Math.ceil(maxSeen / 50) * 50));
+  const radiusPx = (W / 2) - 34;
+  const pxPerKm = radiusPx / scaleMax;
+
+  ctx.strokeStyle = border; ctx.fillStyle = muted;
+  ctx.font = '12px system-ui, sans-serif'; ctx.textAlign = 'center';
+  RINGS.forEach(km => {
+    if (km > scaleMax) return;
+    const r = km * pxPerKm;
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillText(km + ' km', cx, cy - r - 4);
+  });
+  ctx.beginPath(); ctx.moveTo(cx - radiusPx, cy); ctx.lineTo(cx + radiusPx, cy);
+  ctx.moveTo(cx, cy - radiusPx); ctx.lineTo(cx, cy + radiusPx); ctx.stroke();
+  ['N','E','S','W'].forEach((label, i) => {
+    const ang = (i * Math.PI) / 2 - Math.PI / 2;
+    ctx.fillText(label, cx + Math.cos(ang) * (radiusPx + 16), cy + Math.sin(ang) * (radiusPx + 16) + 4);
+  });
+
+  positioned.forEach(a => {
+    const brg = a.bearing_deg * Math.PI / 180;
+    const r = a.distance_km * pxPerKm;
+    const x = cx + Math.sin(brg) * r;
+    const y = cy - Math.cos(brg) * r;
+    const alt = a.altitude || 0;
+    const size = alt > 30000 ? 6 : alt > 15000 ? 5 : 4;
+    ctx.fillStyle = accent;
+    ctx.beginPath(); ctx.arc(x, y, size, 0, Math.PI * 2); ctx.fill();
+    if (a.flight) {
+      ctx.fillStyle = fg; ctx.textAlign = 'left';
+      ctx.fillText(a.flight, x + size + 3, y + 4);
+    }
+  });
+
+  ctx.fillStyle = fg; ctx.textAlign = 'center';
+  ctx.beginPath(); ctx.arc(cx, cy, 3, 0, Math.PI * 2); ctx.fill();
+
+  document.getElementById('stamp').textContent =
+    `${data.count} aircraft · ${data.positioned} positioned · max ${data.max_range_km} km · ${data.messages} msgs · ${data.generated}`;
+  const rows = positioned.slice().sort((a, b) => a.distance_km - b.distance_km).map(a =>
+    `<tr><td>${a.flight || '·'}</td><td class="muted">${a.hex || ''}</td>` +
+    `<td>${a.altitude != null ? Math.round(a.altitude).toLocaleString() + ' ft' : '·'}</td>` +
+    `<td>${a.ground_speed != null ? Math.round(a.ground_speed) + ' kt' : '·'}</td>` +
+    `<td>${a.distance_km} km</td><td>${Math.round(a.bearing_deg)}°</td></tr>`).join('');
+  document.getElementById('rows').innerHTML = rows || '<tr><td colspan="6" class="muted">no positioned aircraft</td></tr>';
+
+  const notice = document.getElementById('notice');
+  if (!data.site) {
+    notice.style.display = 'block';
+    notice.innerHTML = '<b>Site coordinates not configured</b> — range and bearing need the receiver position. Create <code>~/.config/rf-site.json</code> with latitude/longitude.';
+  } else if (data.ok === false) {
+    notice.style.display = 'block'; notice.textContent = data.error;
+  } else { notice.style.display = 'none'; }
+}
+
+async function tick() {
+  try {
+    const res = await fetch('/api/adsb/live', {cache: 'no-store'});
+    draw(await res.json());
+  } catch (e) {
+    document.getElementById('stamp').textContent = 'feed unavailable';
+  }
+}
+tick(); setInterval(tick, 5000);
+</script>"""
+    return shell("RF Monitor · ADS-B", body, active="adsb")
+
+
+@router.get("/adsb", response_class=HTMLResponse)
+def adsb_page() -> str:
+    return render_adsb()
 
 
 # --------------------------------------------------------------------------- #
