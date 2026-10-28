@@ -228,12 +228,21 @@ def decode_audio_file(path: Path | str, freq_hz: int) -> list[dict[str, Any]]:
 # IQ path (live; full-rate samples right after capture)
 # --------------------------------------------------------------------------- #
 def iq_to_cu8(iq, out_path: Path) -> dict[str, Any]:
-    """HackRF IQ (complex float, -1..1) -> rtl_433's cu8 interleaved bytes."""
+    """HackRF IQ (complex float, -1..1) -> rtl_433's cu8 interleaved bytes.
+
+    rtl_433 wants 8-bit unsigned samples centred on 128 as I,Q,I,Q... Casting a
+    complex array to float (the old code) silently dropped Q and handed rtl_433
+    a stream of I samples at twice the real rate, so nothing could ever decode.
+    """
     import numpy as np
 
-    u8 = np.clip(np.round(np.asarray(iq).astype(np.float32) * 127.0 + 128.0), 0, 255).astype(np.uint8)
+    arr = np.asarray(iq, dtype=np.complex64)
+    interleaved = np.empty(arr.size * 2, dtype=np.float32)
+    interleaved[0::2] = arr.real
+    interleaved[1::2] = arr.imag
+    u8 = np.clip(np.round(interleaved * 127.0 + 128.0), 0, 255).astype(np.uint8)
     u8.tofile(str(out_path))
-    return {"path": str(out_path), "bytes": out_path.stat().st_size}
+    return {"path": str(out_path), "bytes": out_path.stat().st_size, "complex_samples": int(arr.size)}
 
 
 def decode_iq(iq, sample_rate_hz: int, center_hz: int, freq_hz: int) -> list[dict[str, Any]]:

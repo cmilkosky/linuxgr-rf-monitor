@@ -159,6 +159,34 @@ def main() -> int:
         else:
             print("PASS: parser keeps checksummed protocols, folds payload, maps types")
 
+    # cu8 conversion: rtl_433 needs interleaved I,Q. Casting complex to float
+    # dropped Q and handed it a stream of I samples - nothing could decode.
+    try:
+        import numpy as np
+
+        samples = 4096
+        tone = np.exp(2j * np.pi * 0.25 * np.arange(samples)).astype(np.complex64)
+        with tempfile.NamedTemporaryFile(suffix=".cu8") as handle:
+            info = rf_decode.iq_to_cu8(tone, Path(handle.name))
+            raw = np.fromfile(handle.name, dtype=np.uint8)
+        if raw.size != samples * 2:
+            print(f"FAIL: cu8 has {raw.size} bytes for {samples} complex samples, expected {samples * 2}")
+            failures += 1
+        elif info.get("complex_samples") != samples:
+            print(f"FAIL: cu8 reports {info.get('complex_samples')} complex samples, expected {samples}")
+            failures += 1
+        else:
+            # e^{j*pi*n/2}: I = 1,0,-1,0 and Q = 0,1,0,-1 -> bytes 255,128,128,255,1,128.
+            # Full scale means 1 and 255 are correct values here, not clipping.
+            expected = [255, 128, 128, 255, 1, 128]
+            if not all(abs(int(a) - b) <= 2 for a, b in zip(raw[:6], expected)):
+                print(f"FAIL: cu8 I/Q not interleaved as expected: {raw[:6].tolist()} != {expected}")
+                failures += 1
+            else:
+                print("PASS: cu8 conversion interleaves I and Q (Q is no longer dropped)")
+    except ImportError:
+        print("SKIP: cu8 test needs numpy")
+
     print("FAILURES:", failures)
     return 1 if failures else 0
 
