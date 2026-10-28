@@ -966,9 +966,34 @@ tick(); setInterval(tick, 5000);
     return shell("RF Monitor · ADS-B", body, active="adsb")
 
 
+@router.get("/adsb/radar", response_class=HTMLResponse)
+def adsb_radar_page() -> str:
+    return render_adsb()
+
+
+def render_adsb_map() -> str:
+    """tar1090 (upstream, maintained) embedded - map, clickable aircraft, photos.
+
+    Chose to reuse tar1090 rather than grow our own map: it already does aircraft
+    selection, a details panel, registration/route lookups and planespotters
+    photos, and it reads dump1090-mutability's aircraft.json directly. The radar
+    view stays at /adsb/radar as the offline-friendly fallback.
+    """
+    body = """
+<div class="blockHead"><h2>ADS-B · 1090 MHz map</h2>
+  <div class="meta">tar1090 · click any aircraft for details and a photo ·
+    <a href="/adsb/radar" style="color:var(--hot);text-decoration:none">radar view →</a></div></div>
+<iframe id="map" title="tar1090 map" style="width:100%;height:calc(100vh - 150px);min-height:520px;border:1px solid var(--border);border-radius:8px;background:#000"></iframe>
+<script>
+  // same host, port 80 where lighttpd serves tar1090 - works by IP or hostname
+  document.getElementById('map').src = location.protocol + '//' + location.hostname + '/tar1090/';
+</script>"""
+    return shell("RF Monitor · ADS-B map", body, active="adsb")
+
+
 @router.get("/adsb", response_class=HTMLResponse)
 def adsb_page() -> str:
-    return render_adsb()
+    return render_adsb_map()
 
 
 # --------------------------------------------------------------------------- #
