@@ -44,6 +44,14 @@ RECENT_MINUTES = float(os.environ.get("RF_SCOUT_RECENT_MINUTES", "10"))
 SNR_MIN_DB = float(os.environ.get("RF_SCOUT_SNR_MIN", "8.0"))
 BURST_SNR_MIN = float(os.environ.get("RF_SCOUT_BURST_SNR_MIN", "25.0"))
 EXCESS_MIN_DB = float(os.environ.get("RF_SCOUT_EXCESS_MIN", "15.0"))
+# Strength = the blob's AVERAGE level above the spectrum-wide floor, i.e. the mean over
+# every bin it spans - not its single best bin. A max over n noise bins sits ~ln(n) above
+# the mean, so a max-bin rule handed free SNR to whichever blob spanned more spectrum.
+# Measured on live rows 2026-10-28: wide blobs (>=4 bins) read 34.9 dB by max vs 27.0 dB
+# by mean, while 1-2 bin signals moved 0.1 dB. Ranking by in-band average is therefore
+# width-independent. peak_freq_hz / floor_db / jitter still describe the loudest bin.
+# RF_SCOUT_STRENGTH_BINS: 0 = average all bins (default); N>0 = average the top N only.
+STRENGTH_BINS = int(os.environ.get("RF_SCOUT_STRENGTH_BINS", "0"))
 ARTIFACT_MAX_HZ = int(os.environ.get("RF_SCOUT_ARTIFACT_MAX_HZ", "6500000"))
 MATCH_HZ = int(os.environ.get("RF_SCOUT_MATCH_HZ", "1500000"))
 STALE_MINUTES = int(os.environ.get("RF_SCOUT_STALE_MIN", "15"))
@@ -322,8 +330,15 @@ def detect_blobs(
         seg_strength = strength[seg].astype(np.float64)
         weights = np.clip(np.maximum(seg_delta, 0.0) + 0.5, 0.1, None)
         center = float((seg_freqs * weights).sum() / weights.sum())
+        # Strength = mean over the blob's bins (see STRENGTH_BINS). The single-bin max
+        # handed ~+8 dB of free SNR to a 27-bin blob against a 2-bin one, which is how a
+        # 54 MHz union row outranked real carriers. peak_pos stays the strongest single
+        # bin so floor_db/jitter/peak_freq still describe a real bin.
         peak_pos = int(group[int(np.argmax(seg_strength))])
-        blob_peak_snr = float(seg_strength.max())
+        order = np.argsort(seg_strength)
+        chosen = order if STRENGTH_BINS <= 0 or STRENGTH_BINS >= seg_strength.size else order[-STRENGTH_BINS:]
+        blob_peak_snr = float(seg_strength[chosen].mean())
+        band_rssi = float(recent_max[group[chosen]].mean())
         peak_floor = float(floor_arr[peak_pos])
         peak_row = matrix[peak_pos]
         # "on-air" = fraction of minutes the bin is above the spectrum floor at
@@ -345,7 +360,7 @@ def detect_blobs(
                 "peak_snr_db": round(blob_peak_snr, 2),
                 "mean_snr_db": round(float(excess[seg].mean()), 2),
                 "delta_db": round(float(seg_delta.max()), 2),
-                "peak_rssi_db": round(float(recent_max[peak_pos]), 2),
+                "peak_rssi_db": round(band_rssi, 2),
                 "floor_db": round(peak_floor, 2),
                 "duty": round(duty, 3),
                 "jitter_db": round(float(recent_std[peak_pos]), 2),

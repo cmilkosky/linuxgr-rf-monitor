@@ -464,14 +464,15 @@ def render_detail(episode: dict[str, Any]) -> str:
             features = {}
 
     # peak_snr_db is measured against the spectrum-wide floor; recover that floor
-    # exactly from the absolute peak so the sentence cannot misstate the baseline.
+    # exactly from the absolute level so the sentence cannot misstate the baseline.
     global_floor = None
     try:
         global_floor = float(episode["peak_rssi_db"]) - float(episode["peak_snr_db"])
     except (TypeError, ValueError, KeyError):
         pass
     evidence = [
-        (f"Peak {snr_text(episode.get('peak_snr_db'))} above the spectrum noise floor "
+        (f"Strongest {min(int(episode.get('n_bins') or 1), 4)} × 500 kHz bins average "
+         f"{snr_text(episode.get('peak_snr_db'))} above the spectrum noise floor "
          f"({global_floor:.1f} dB); this bin's own 6 h median is {episode.get('floor_db'):.1f} dB.")
         if global_floor is not None and episode.get("floor_db") is not None else "",
         f"Occupied roughly {bw_text(episode.get('bandwidth_hz'))} across {int(episode.get('n_bins') or 1)} × 1 MHz sweep bin(s).",
