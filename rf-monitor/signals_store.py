@@ -194,7 +194,7 @@ REOPEN_HOURS = float(os.environ.get("RF_SIGNALS_REOPEN_HOURS", "6"))
 
 
 def _best_overlap(rows: list[sqlite3.Row], low_hz: int, high_hz: int,
-                  min_overlap: float) -> sqlite3.Row | None:
+                  min_overlap: float, width_ratio: float = 0.4) -> sqlite3.Row | None:
     best: sqlite3.Row | None = None
     best_fraction = 0.0
     for row in rows:
@@ -202,7 +202,15 @@ def _best_overlap(rows: list[sqlite3.Row], low_hz: int, high_hz: int,
         if overlap <= 0:
             continue
         smaller = min(int(high_hz) - int(low_hz), int(row["high_hz"]) - int(row["low_hz"]))
+        larger = max(int(high_hz) - int(low_hz), int(row["high_hz"]) - int(row["low_hz"]))
         fraction = overlap / max(1, smaller)
+        if fraction < min_overlap:
+            continue
+        # Comparable widths only. A 1 MHz signal sitting inside a 30 MHz band scores 100%
+        # overlap on the smaller span and used to be absorbed into the band's row, which is
+        # how seven rows came to span 18-113 MHz. Same emitter means similar footprint.
+        if smaller / max(1, larger) < width_ratio:
+            continue
         if fraction > best_fraction:
             best_fraction, best = fraction, row
     return best if best_fraction >= min_overlap else None
@@ -268,17 +276,20 @@ def upsert_blob(blob: dict[str, Any], tolerance_hz: int, stale_minutes: int = 15
         first = match["first_seen"]
         with connect() as conn:
             conn.execute(
-                "UPDATE episodes SET freq_hz=?, low_hz=MIN(low_hz, ?), high_hz=MAX(high_hz, ?),"
-                " bandwidth_hz=MAX(high_hz, ?) - MIN(low_hz, ?),"
-                " n_bins=MAX(n_bins, ?),"
+                # Span follows the CURRENT blob. It used to be
+                # low_hz=MIN(low_hz,?), high_hz=MAX(high_hz,?), which only ever grew: episode 1
+                # reached 18.0-72.1 MHz (54.1 MHz) while its widest single blob was 48 bins
+                # (24 MHz). Over 14,431 refreshes a row became a union of everything nearby
+                # instead of one emitter's footprint.
+                "UPDATE episodes SET freq_hz=?, low_hz=?, high_hz=?, bandwidth_hz=?,"
+                " n_bins=?,"
                 " peak_snr_db=?, mean_snr_db=?, delta_db=?, peak_rssi_db=?, floor_db=?, duty=?,"
                 " last_seen=?, sightings=sightings+1, state='open', score=?,"
                 " band=?, likely=?, confidence=?, class=?, known_emitter=?, features_json=?"
                 " WHERE id=?",
                 (
                     int(blob["freq_hz"]), int(blob["low_hz"]), int(blob["high_hz"]),
-                    int(blob["high_hz"]), int(blob["low_hz"]),
-                    int(blob["n_bins"]),
+                    int(blob["bandwidth_hz"]), int(blob["n_bins"]),
                     peak_snr, float(blob["mean_snr_db"]), float(blob.get("delta_db") or 0.0),
                     float(blob["peak_rssi_db"]),
                     float(blob["floor_db"]), float(blob["duty"]),
@@ -498,6 +509,12 @@ SORTABLE = {
     "sightings": "sightings",
 }
 
+# A contiguous blob cannot be wider than its own bin count. Rows built by the old
+# MIN/MAX span accumulation violate this (episode 1 claimed 54.1 MHz from 48 bins), so
+# they are hidden from the list rather than deleted - the history stays, the display stops
+# asserting something physically impossible.
+SPAN_INVARIANT = "bandwidth_hz <= n_bins * 1000000 + 1000000"
+
 
 def query_episodes(
     *,
@@ -521,6 +538,7 @@ def query_episodes(
 ) -> list[dict[str, Any]]:
     where: list[str] = []
     params: list[Any] = []
+    where.append(SPAN_INVARIANT)
     if section == "strongest":
         where.append("last_seen >= ?")
         params.append(local_day_start_utc(0))
@@ -593,26 +611,27 @@ def dashboard_counts(exclude_source: str | None = None) -> dict[str, Any]:
     """
     today = local_day_start_utc(0)
     src = " AND (source IS NULL OR source != ?)" if exclude_source else ""
+    span = " AND " + SPAN_INVARIANT
     params: tuple[Any, ...] = (today,) + ((exclude_source,) if exclude_source else ())
     with connect() as conn:
         total = conn.execute(
-            "SELECT COUNT(*) FROM episodes WHERE last_seen >= ?" + src, params).fetchone()[0]
+            "SELECT COUNT(*) FROM episodes WHERE last_seen >= ?" + src + span, params).fetchone()[0]
         new = conn.execute(
-            "SELECT COUNT(*) FROM episodes WHERE last_seen >= ? AND is_new=1" + src, params).fetchone()[0]
+            "SELECT COUNT(*) FROM episodes WHERE last_seen >= ? AND is_new=1" + src + span, params).fetchone()[0]
         decoded = conn.execute(
-            "SELECT COUNT(*) FROM episodes WHERE last_seen >= ? AND decode_status='decoded'" + src,
+            "SELECT COUNT(*) FROM episodes WHERE last_seen >= ? AND decode_status='decoded'" + src + span,
             params).fetchone()[0]
         by_type = {
             row[0]: row[1]
             for row in conn.execute(
                 "SELECT decode_type, COUNT(*) FROM episodes WHERE last_seen >= ? AND decode_type IS NOT NULL"
-                + src + " GROUP BY decode_type",
+                + src + span + " GROUP BY decode_type",
                 params,
             ).fetchall()
         }
         last_params: tuple[Any, ...] = (exclude_source,) if exclude_source else ()
         last = conn.execute(
-            "SELECT MAX(last_seen) FROM episodes WHERE 1=1" + src, last_params).fetchone()[0]
+            "SELECT MAX(last_seen) FROM episodes WHERE 1=1" + src + span, last_params).fetchone()[0]
     return {
         "today_total": total,
         "today_new": new,

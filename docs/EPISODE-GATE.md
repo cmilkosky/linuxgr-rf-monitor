@@ -100,6 +100,41 @@ python3 tests/test_hopper.py         # 4 checks
 python3 tests/test_decode.py         # 6 checks
 ```
 
+## Spans only ever grew — 54.1 MHz from 48 bins
+
+Found 2026-10-28 from the operator's question about a "48.5 h" duration sitting under a
+"TODAY" heading. Two separate problems, only one of them the duration.
+
+**Duration was lifetime, not today.** The section filters `last_seen >= local midnight`,
+so a station heard all week shows its full lifetime. Renamed to
+`STRONGEST SIGNALS (ACTIVE TODAY, BY SNR)` and the strip states that duration counts from
+first heard. The number is wall-clock from first to last sighting, so a signal seen at
+09:00 and again at 17:00 reports 8 h even if it was only on air for two minutes.
+
+**The bandwidth was fabricated by the refresh.** `upsert_blob` updated with
+`low_hz=MIN(low_hz,?), high_hz=MAX(high_hz,?)` — a span that can only grow. Episode 1
+reached 18.0–72.1 MHz (54.1 MHz) while `n_bins` was 48, and 48 contiguous bins at the
+sweep's ~450 kHz step cannot exceed ~22 MHz. Seven overlapping rows covered 18–113 MHz.
+
+Two compounding faults:
+
+1. The span never shrank, so a row became a union of everything ever detected nearby.
+2. Matching used overlap against the *smaller* span, so a 1 MHz signal inside a 54 MHz row
+   scored 100% overlap and was absorbed. 14,431 sightings across 2,820 sweeps is ~5 blobs
+   per sweep eating the same row. The 6 h reopen window made it worse by keeping the row
+   alive longer.
+
+**Fixes**: the span follows the current blob (shrinkable, `n_bins` too), and matching
+requires comparable widths (`smaller/larger >= 0.4`), so a narrow signal inside a wide
+band is its own emitter. Legacy rows violating `bandwidth_hz <= n_bins * 1e6 + 1e6` are
+hidden by `SPAN_INVARIANT` rather than deleted — the display stops asserting something
+physically impossible while the history stays.
+
+**Verified**: 13 rows refreshed after the fix all have spans consistent with their bin
+counts (1.45 MHz / 2 bins, 8.73 MHz / 18 bins, 2.36 MHz / 4 bins). The strongest list now
+reads 2437 MHz Wi-Fi at 16.0 MHz, 909 MHz at 1.91 MHz, 51 MHz at 8.7 MHz; the 40 MHz /
+54.1 MHz artifacts are gone from the page. 8 legacy rows are hidden.
+
 ## Still open
 
 - **The daily rate is not yet confirmed.** 0 creations in the first 5 minutes is not a

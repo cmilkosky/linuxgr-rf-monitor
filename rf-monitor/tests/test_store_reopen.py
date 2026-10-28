@@ -77,6 +77,25 @@ def main() -> int:
         print(f"FAIL: old episode gave created={late['created']} id={late['id']}")
         failures += 1
 
+    # 6. The stored span follows the current blob, so a row can shrink again.
+    wide = store.upsert_blob(blob(50.0, width_hz=4_000_000), 1_500_000, 15)
+    narrower = store.upsert_blob(blob(50.0, width_hz=3_000_000), 1_500_000, 15)
+    row = store.get_episode(wide["id"])
+    if not narrower["created"] and row and row["bandwidth_hz"] == 3_000_000:
+        print("PASS: span tracks the current blob instead of only ever growing")
+    else:
+        print(f"FAIL: shrink gave created={narrower['created']} bw={row and row['bandwidth_hz']}")
+        failures += 1
+
+    # 7. A narrow signal inside a wide band is a different emitter, not part of the band.
+    band = store.upsert_blob(blob(50.0, width_hz=30_000_000), 1_500_000, 15)
+    narrow = store.upsert_blob(blob(50.0, width_hz=1_000_000), 1_500_000, 15)
+    if narrow["created"] and narrow["id"] != band["id"]:
+        print("PASS: a 1 MHz signal inside a 30 MHz band is not absorbed into it")
+    else:
+        print(f"FAIL: narrow blob created={narrow['created']} id={narrow['id']} vs band {band['id']}")
+        failures += 1
+
     print("FAILURES:", failures)
     return 1 if failures else 0
 

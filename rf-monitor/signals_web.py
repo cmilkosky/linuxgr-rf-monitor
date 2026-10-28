@@ -316,7 +316,7 @@ def render_dashboard() -> str:
     latest = store.query_episodes(section="latest", limit=50, sort="time", direction="desc",
                                   exclude_source=EXCLUDED_SOURCE)
 
-    blocks = [section_block("STRONGEST SIGNALS (TODAY, BY SNR)", strongest,
+    blocks = [section_block("STRONGEST SIGNALS (ACTIVE TODAY, BY SNR)", strongest,
                             section_key="strongest",
                             empty_note="Nothing above the noise floor yet today.")]
     for key, title, types in TYPE_SECTIONS:
@@ -338,6 +338,7 @@ def render_dashboard() -> str:
 </div>
 <div class="muted" style="margin:-4px 0 14px;font-size:12px">
   ADS-B aircraft are not in this list — they live on the <a href="/adsb" style="color:var(--hot);text-decoration:none">ADS-B page</a>.
+  Duration counts from when a signal was first heard, so a station active all week shows its lifetime, not today's time.
 </div>"""
     return shell("RF Monitor · Signals", strip + "".join(blocks), active="signals", refresh=60)
 
