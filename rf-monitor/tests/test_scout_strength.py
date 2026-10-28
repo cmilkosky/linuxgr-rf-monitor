@@ -71,11 +71,11 @@ def main() -> int:
     # 2. The old max-bin rule overstated a wide blob by several dB; the new one does not.
     wide_max = np.mean([reported(noise_levels(rng, 48), int(300e6), 1)["peak_snr_db"]
                         for _ in range(trials)])
-    if wide_max - wide >= 3.0 and abs(wide - (FLOOR + LEVEL)) < 2.0:
+    if wide_max - wide >= 3.0 and abs(wide - LEVEL) < 2.0:
         print(f"PASS: 48-bin blob reads {wide:.1f} dB by average vs {wide_max:.1f} dB by max "
-              f"(true level {FLOOR + LEVEL:.0f} dB)")
+              f"(true in-band level {LEVEL:.0f} dB above floor)")
     else:
-        print(f"FAIL: 48-bin average {wide:.1f} dB, max {wide_max:.1f} dB, true {FLOOR + LEVEL:.0f}")
+        print(f"FAIL: 48-bin average {wide:.1f} dB, max {wide_max:.1f} dB, true {LEVEL:.0f} dB")
         failures += 1
 
     # 3. A single-bin signal is unchanged - the fix must not mute narrow carriers.

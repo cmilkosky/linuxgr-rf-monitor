@@ -471,9 +471,9 @@ def render_detail(episode: dict[str, Any]) -> str:
     except (TypeError, ValueError, KeyError):
         pass
     evidence = [
-        (f"Strongest {min(int(episode.get('n_bins') or 1), 4)} × 500 kHz bins average "
-         f"{snr_text(episode.get('peak_snr_db'))} above the spectrum noise floor "
-         f"({global_floor:.1f} dB); this bin's own 6 h median is {episode.get('floor_db'):.1f} dB.")
+        (f"Averages {snr_text(episode.get('peak_snr_db'))} above the spectrum noise floor "
+         f"({global_floor:.1f} dB) across {int(episode.get('n_bins') or 1)} × 500 kHz bins; "
+         f"this bin's own 6 h median is {episode.get('floor_db'):.1f} dB.")
         if global_floor is not None and episode.get("floor_db") is not None else "",
         f"Occupied roughly {bw_text(episode.get('bandwidth_hz'))} across {int(episode.get('n_bins') or 1)} × 1 MHz sweep bin(s).",
         f"On-air {float(episode.get('duty') or 0)*100:.0f}% of the observation window "
@@ -539,7 +539,7 @@ def render_detail(episode: dict[str, Any]) -> str:
     grid = f"""
 <div class="detailGrid">
   <div class="card"><span>Frequency</span><strong>{mhz(episode['freq_hz'])} MHz</strong></div>
-  <div class="card"><span>Peak SNR</span><strong>{snr_text(episode.get('peak_snr_db'))}</strong></div>
+  <div class="card"><span>Strength (in-band avg)</span><strong>{snr_text(episode.get('peak_snr_db'))}</strong></div>
   <div class="card"><span>Bandwidth</span><strong>{bw_text(episode.get('bandwidth_hz'))}</strong></div>
   <div class="card"><span>Score</span><strong>{float(episode.get('score') or 0):.0f}/100</strong></div>
   <div class="card"><span>On-air</span><strong>{float(episode.get('duty') or 0)*100:.0f}%</strong></div>
