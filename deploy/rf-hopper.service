@@ -1,0 +1,23 @@
+[Unit]
+Description=RF Monitor hopper lane (RTL2 parks on watchlist frequencies)
+Documentation=https://github.com/cmilkosky/linuxgr-rf-monitor
+After=network.target rf-adsb-readsb.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=cmilkosk
+Group=cmilkosk
+WorkingDirectory=/home/cmilkosk/rf-monitor
+# Runs as cmilkosk for the same reason readsb does: the RTL device nodes are
+# root:plugdev and cmilkosk is in plugdev, and the episodes/artifacts are its files.
+EnvironmentFile=-/home/cmilkosk/.config/rf-hopper.env
+ExecStart=/usr/bin/python3 /home/cmilkosk/rf-monitor/rf_hopper.py --loop
+Restart=always
+RestartSec=10
+# Below the decoders on purpose: a hop that lands late is cheap, a starved
+# ADS-B or wideband pass is not.
+Nice=5
+
+[Install]
+WantedBy=multi-user.target
