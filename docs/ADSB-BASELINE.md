@@ -52,6 +52,36 @@ Consequence for hardware decisions: adding 3–4 dB of split loss or noise figur
 (an 8-port multicoupler) would take an already short range down by another
 ~25–30%. Fix range first, then consider ports.
 
+## Gain A/B: max gain is right, the chain is gain-starved
+
+Hypothesis tested: strong local FM was desensing the R820T at max gain, so a lower
+gain setting would hear *more*. Tested by running a second `dump1090-mutability`
+on the idle RTL2 (device index 1, same antenna feed) at **38.6 dB** for ~6 minutes
+while the lane kept running at max gain, then comparing both JSON snapshots at the
+same instant:
+
+| Instance | Aircraft | Max range | Messages |
+|---|---|---|---|
+| lane, gain = max | **39** | 72.4 km | 474,566 (cumulative) |
+| test, gain = 38.6 dB | 29 | 72.4 km | 20,588 (~99 msg/s) |
+
+Lower gain tracked **26% fewer aircraft for identical range**. So the front end is
+not overloaded — it is short of signal, and turning gain down only loses the weak
+ones. The FM-desense hypothesis is **rejected**.
+
+What that implies for spending: the wins available are *ahead* of the receiver, not
+in the tuner setting or the port count.
+
+1. **A 1090 MHz LNA + bandpass at the antenna** — sets the system noise figure at
+   the mast instead of the RTL's ~5–6 dB, worth roughly 4–5 dB ≈ 1.6–1.8× range
+   (38 nm → ~60–65 nm). Keep the RTL gain low-ish once an LNA is in line.
+2. **A dedicated 1090 MHz antenna** — the D3000N is broadband and low-gain at
+   1090; a collinear is worth ~5–6 dBi, another ~2× range on its own.
+3. **Not** more multicoupler ports: that adds loss to a chain that is already
+   short of signal.
+
+
+
 ## Re-measuring
 
 After any change, re-run the same two queries and compare max/p90 range and
