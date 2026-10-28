@@ -482,9 +482,9 @@ def decode_episode(
                 "summary": summary, "hits": hits, "tried": tried, "errors": errors}
 
     if not dry_run and tried:
-        # Nothing decoded: leave decode_status alone (it is still 'captured'),
-        # the attempt rows are the record that we looked.
-        pass
+        # Nothing decoded: record that honestly. Leaving it at 'captured' made a
+        # negative result indistinguishable from a row nobody had ever tried.
+        store.set_decode_status(episode_id, "no_frame")
     return {"episode_id": episode_id, "status": "no_decode", "decode_type": None,
             "summary": None, "hits": [], "tried": tried, "errors": errors}
 
@@ -508,6 +508,9 @@ def pending_episodes(limit: int | None = None, *, since: str | None = None,
     sql = (
         "SELECT e.* FROM episodes e WHERE e.decode_type IS NULL"
         " AND e.capture_id IS NOT NULL"
+        # 'unavailable' = captured once, but its audio was evicted by the artifact cap
+        # before any decoder saw it. Nothing can decode it, so it is not "pending".
+        " AND COALESCE(e.decode_status,'none') != 'unavailable'"
     )
     params: list[Any] = []
     if not retry:

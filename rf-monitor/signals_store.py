@@ -107,6 +107,7 @@ CREATE TABLE IF NOT EXISTS decode_attempts (
     started_at  TEXT NOT NULL,
     finished_at TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_att_ep ON decode_attempts(episode_id);
 """
 
 
@@ -585,7 +586,17 @@ def query_episodes(
     if section == "strongest" and sort == "time":
         order_col, order_dir = "peak_snr_db", "DESC"
 
-    sql = "SELECT * FROM episodes"
+    # Decode honesty: "we tried every decoder and found no frame" and "never tried"
+    # are different facts, and the row must be able to say which. Two correlated
+    # subqueries (attempts are ~1k rows, indexed on episode_id) keep the page from
+    # inferring one from the other.
+    sql = (
+        "SELECT e.*,"
+        " (SELECT COUNT(*) FROM decode_attempts d WHERE d.episode_id = e.id) AS attempt_count,"
+        " (SELECT GROUP_CONCAT(DISTINCT d.decoder) FROM decode_attempts d"
+        "   WHERE d.episode_id = e.id AND d.status != 'ok') AS attempt_decoders"
+        " FROM episodes e"
+    )
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += f" ORDER BY {order_col} {order_dir} LIMIT ? OFFSET ?"

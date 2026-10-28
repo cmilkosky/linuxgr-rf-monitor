@@ -189,8 +189,18 @@ def decode_text(row: dict[str, Any]) -> str:
     if row.get("decode_status") == "decoded" and row.get("decoded_summary"):
         return f'<span class="pill dec">decoded</span> {esc(row["decoded_summary"])[:110]}'
     status = row.get("decode_status") or "none"
+    # "captured" alone used to mean both "not tried yet" and "tried, nothing there",
+    # because the decode stage left the status untouched on a negative result. The
+    # attempt rows are the truth: no attempt rows = genuinely pending.
+    tried = int(row.get("attempt_count") or 0) > 0
+    decoders = (row.get("attempt_decoders") or "").replace(",", ", ")
+    if status in ("captured", "no_frame") and tried:
+        return (f'<span class="muted">tried {esc(decoders)} · no frame</span>'
+                if decoders else '<span class="muted">tried · no frame</span>')
     if status == "captured":
         return '<span class="muted">sample captured · decoder pending</span>'
+    if status == "unavailable":
+        return '<span class="muted">audio purged · undecodable</span>'
     if status == "failed":
         return '<span class="muted">capture failed</span>'
     return '<span class="muted">—</span>'

@@ -31,8 +31,9 @@ header) are allowed to write one.
 
 Every attempt lands in `decode_attempts` (decoder, status, timing) whether or
 not it produced a frame, so a re-run can skip work and an operator can see what
-was tried. Only a real frame changes `decode_type`; everything else keeps
-`decode_status='captured'`.
+was tried. Only a real frame changes `decode_type`; a run that produced nothing
+sets `decode_status='no_frame'` (it used to leave the row at `'captured'`, which
+is what the honesty fix below is about).
 
 ## The bug this exposed
 
@@ -57,6 +58,45 @@ They are **not** backfilled. Decoding starts with the next capture. To revisit a
 specific old episode, clear its `capture_id` (and set `decode_status='none'`) and
 let the scout re-capture it with the fixed path.
 
+## "sample captured · decoder pending" on 1,691 rows (fixed 2026-10-28)
+
+The Signals table showed `sample captured · decoder pending` on ~40% of episodes
+and none of it was a queue: nothing on LinuxGR runs `--backfill` on a schedule,
+and most of the rows could never be decoded at all.
+
+Measured before the fix (4,239 episodes): `decode_status='captured'` on **1,691**,
+made of three unrelated facts:
+
+| Bucket | Count | What it actually was |
+|---|---|---|
+| attempted, nothing found | 404 | multimon-ng am/nfm/wfm had run; 1,212 `no_frame` attempt rows |
+| never attempted, audio on disk | 206 | genuinely pending, waiting for a manual backfill |
+| never attempted, audio purged | 1,081 | artifact cap evicted the audio; undecodable forever |
+
+Two root causes, both fixed in code rather than by tuning anything:
+
+1. `decode_episode()` left `decode_status` at `'captured'` on a negative result,
+   so "tried and found nothing" and "never tried" were the same string.
+   It now writes `'no_frame'`, and the table reads the attempt rows
+   (`attempt_count` / `attempt_decoders`, added to `query_episodes`) so a row with
+   attempts says `tried multimon-ng/nfm, multimon-ng/am, multimon-ng/wfm · no frame`.
+2. Rows whose `audio-*` artifacts were evicted by `enforce_cap` were still counted
+   as pending and re-scanned by every backfill. They are now `'unavailable'`
+   ("audio purged · undecodable") and `pending_episodes()` skips them.
+
+One-off migration on LinuxGR (DB backed up to
+`signals.db.bak-decodehonesty-20261028T224302Z`): 409 rows `captured` -> `no_frame`,
+1,142 rows -> `unavailable`. Then `rf_decode.py --backfill --limit 400` ran the 145
+rows that still had audio: 145 considered, **0 decoded**, 145 no_decode, 63 s.
+`pending_backfill` is now 0 and no row is left at `'captured'`.
+
+The lesson worth keeping: the decode ladder has produced 2 non-aircraft frames in
+its life (2,230 of 2,232 decoded rows are ADS-B aircraft). A capture lane feeds it
+wideband blobs at 31-165 MHz - "broad radio band", FMCW candidates - and AFSK /
+POCSAG / FLEX / EAS have nothing to lock onto there. A pending count is not a
+backlog to drain; it was the capture lane's signal choice, and it needed a
+label that says so.
+
 ## Tests
 
 `tests/test_decode.py` (needs `multimon-ng` and `gen_packets` from direwolf):
@@ -73,6 +113,13 @@ testing the generator, not the decoder. `gen_packets` is an independent referenc
 encoder and is what the test uses.
 
 Live smoke: `RF_CAPTURE_SECONDS=30 python3 tests/smoke_live_decode.py 144.39`.
+
+`tests/test_decode_honesty.py` guards the labels above without hardware: a row with
+attempts renders "no frame", a row without renders "pending", a purged row renders
+"undecodable", `pending_episodes()` skips it, and a decode run that tried nothing
+leaves the status alone. It imports `signals_web`, so run it with the interpreter
+that has fastapi - `/usr/bin/python3` on LinuxGR - and *not* with
+`PYTHONNOUSERSITE=1`, which hides the user-site fastapi.
 
 ## Operational notes
 
