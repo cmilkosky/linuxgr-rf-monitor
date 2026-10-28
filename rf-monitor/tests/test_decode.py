@@ -74,7 +74,11 @@ def synth_iq(wav_path: Path, offset_hz: float = 250_000.0, rate: int = 2_000_000
     phase = 2.0 * np.pi * deviation_hz * np.cumsum(mod) / float(rate)
     iq = np.exp(1j * phase).astype(np.complex64)
     t = np.arange(iq.size, dtype=np.float64)
-    iq = (iq * np.exp(2j * np.pi * offset_hz * t / rate)).astype(np.complex64)
+    # Tuning ABOVE a signal puts it BELOW the LO in baseband, i.e. at -offset_hz.
+    # The old fixture placed it at +offset_hz, the same sign error the DDC had, so
+    # the test could never catch it. Measured against a real capture (WX7 at
+    # 162.550 with the LO at 162.475 -> +74.8 kHz) to fix the convention here.
+    iq = (iq * np.exp(-2j * np.pi * offset_hz * t / rate)).astype(np.complex64)
     if noise:
         rng = np.random.default_rng(7)
         iq = iq + (rng.standard_normal(iq.size) + 1j * rng.standard_normal(iq.size)).astype(np.complex64) * noise

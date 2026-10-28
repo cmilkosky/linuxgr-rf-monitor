@@ -1,0 +1,18 @@
+[Unit]
+Description=RF Monitor wideband lane (HackRF #2 channelizer: one capture, whole band)
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=cmilkosk
+Group=cmilkosk
+WorkingDirectory=/home/cmilkosk/rf-monitor
+EnvironmentFile=/home/cmilkosk/.config/rf-wideband-lane.env
+ExecStart=/usr/bin/python3 /home/cmilkosk/rf-monitor/rf_wideband_lane.py --loop
+Restart=always
+RestartSec=30
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

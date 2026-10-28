@@ -327,7 +327,11 @@ def ddc_audio(iq, sample_rate_hz: int, center_hz: int, target_hz: int,
 
     fs = float(sample_rate_hz)
     x = np.asarray(iq)
-    offset = float(center_hz) - float(target_hz)
+    # Signal at target sits at (target - center) in the captured baseband, so the
+    # correction is a shift by (center - target). Getting this backwards tunes to
+    # the mirror frequency: measured on a real capture, WX7 at 162.550 with the LO
+    # at 162.475 appears at +74.8 kHz, and only exp(-j*2pi*74.8k*t) brings it to DC.
+    offset = float(target_hz) - float(center_hz)
     if abs(offset) > 1e-6:
         t = np.arange(x.size, dtype=np.float64)
         x = (x * np.exp(-2j * np.pi * offset * t / fs)).astype(np.complex64)
