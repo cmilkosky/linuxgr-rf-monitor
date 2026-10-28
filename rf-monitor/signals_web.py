@@ -23,6 +23,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 
 import signals_store as store
+import rf_watchlist
 
 router = APIRouter()
 LOCAL_TZ = ZoneInfo("America/New_York")
@@ -207,6 +208,7 @@ def shell(title: str, body: str, *, active: str = "signals", refresh: int = 0) -
   <nav>
     {nav_item("signals", "/", "Signals")}
     {nav_item("spectrum", "/spectrum", "Spectrum")}
+    {nav_item("watchlist", "/watchlist", "Watchlist")}
     {nav_item("health", "/ha-radio-health", "Radio Health")}
   </nav>
 </header>
@@ -558,6 +560,19 @@ def render_detail(episode: dict[str, Any]) -> str:
   </form>{label_html}
 </div>"""
 
+    already = rf_watchlist.entry_for_freq(int(episode["freq_hz"]))
+    if already:
+        already_html = (f'<span class="muted" style="font-size:12.5px">already on the watchlist · '
+                        f'radio {esc(already.get("radio") or "unassigned")} · '
+                        f'{"enabled" if already.get("enabled") else "disabled"}</span>')
+    else:
+        already_html = ""
+    promote_panel = f"""
+<div class="panel"><h3>Watch this frequency?</h3>
+  <div class="muted" style="font-size:12.5px">Add {esc(mhz(episode.get('freq_hz')))} to the watchlist and give it a parked radio if one is free. A frequency with no free radio is still recorded, so nothing is lost.</div>
+  <div class="labelRow"><a class="btn" href="/watchlist/promote?episode_id={int(episode['id'])}">Add to watchlist</a>{already_html}</div>
+</div>"""
+
     body = f"""
 <div class="blockHead"><h2>SIGNAL #{int(episode['id'])}</h2>
   <div class="meta"><a href="/signals/table?section=all" style="color:var(--hot);text-decoration:none">← back to all signals</a></div></div>
@@ -566,6 +581,7 @@ def render_detail(episode: dict[str, Any]) -> str:
   <table><thead><tr><th>Decoder</th><th>Status</th><th>Detail</th><th>When</th></tr></thead>
   <tbody>{attempt_rows}</tbody></table>
 </div>
+{promote_panel}
 {label_form}"""
     return shell(f"RF Monitor · signal #{episode['id']}", body, active="signals")
 
@@ -665,6 +681,105 @@ def signals_label(episode_id: int, request: Request, label: str = Query("known")
         raise HTTPException(400, "unknown label")
     store.add_label(int(episode_id), label, note or None)
     return RedirectResponse(f"/signals/{int(episode_id)}", status_code=303)
+
+
+# --------------------------------------------------------------------------- #
+# watchlist
+# --------------------------------------------------------------------------- #
+def render_watchlist(message: str = "") -> str:
+    rf_watchlist.seed_defaults()
+    entries = rf_watchlist.list_entries()
+    radios = rf_watchlist.radio_status()
+
+    radio_rows = "".join(
+        f"<tr><td>{esc(r['name'])}</td><td>{esc(r['kind'])}</td><td>{esc(r['duty'])}</td>"
+        f"<td>{esc(((r.get('assigned') or {}).get('label')) or '—')}</td>"
+        f"<td>{'free' if r['free'] else ('in use' if r.get('assigned') else 'not a parked slot')}</td></tr>"
+        for r in radios
+    )
+    if entries:
+        entry_rows = "".join(
+            f"<tr><td>{e['id']}</td><td>{esc(mhz(e['freq_hz']))}</td><td>{esc(e['label'] or '')}</td>"
+            f"<td>{esc(e['decoder'] or '')}</td><td>{esc(e['mode'])}</td>"
+            f"<td>{esc(e['radio'] or 'unassigned')}</td><td>{'yes' if e['enabled'] else 'no'}</td>"
+            f"<td class=\"muted\">{esc((e['notes'] or '')[:80])}</td>"
+            f"<td><a class=\"btn\" href=\"/watchlist/{e['id']}/toggle\">{'disable' if e['enabled'] else 'enable'}</a> "
+            f"<a class=\"btn\" href=\"/watchlist/{e['id']}/remove\">remove</a></td></tr>"
+            for e in entries
+        )
+        entry_table = (
+            "<table><thead><tr><th>#</th><th>Frequency</th><th>Label</th><th>Decoder</th><th>Mode</th>"
+            "<th>Radio</th><th>On</th><th>Notes</th><th></th></tr></thead>"
+            f"<tbody>{entry_rows}</tbody></table>"
+        )
+    else:
+        entry_table = ('<div class="muted">Nothing on the watchlist yet — open any signal and use '
+                       '“Add to watchlist”.</div>')
+
+    message_html = f'<div class="panel"><b>{esc(message)}</b></div>' if message else ""
+    body = f"""
+<div class="blockHead"><h2>WATCHLIST</h2><div class="meta">{len(entries)} entries</div></div>
+{message_html}
+<div class="panel"><h3>Frequencies to listen to</h3>{entry_table}</div>
+<div class="panel"><h3>Add a frequency by hand</h3>
+  <form method="get" action="/watchlist/add" class="labelRow">
+    <input name="freq_mhz" placeholder="frequency in MHz, e.g. 144.390" size="26" />
+    <input name="label" placeholder="label (optional)" size="30" />
+    <button type="submit">Add</button>
+  </form>
+</div>
+<div class="panel"><h3>Radios</h3>
+  <table><thead><tr><th>Radio</th><th>Kind</th><th>Duty</th><th>Assigned to</th><th>State</th></tr></thead>
+  <tbody>{radio_rows}</tbody></table>
+  <div class="muted" style="font-size:12.5px">A parked entry needs a radio with duty <i>parked</i>. When none is free the entry is still recorded, with no radio — intent kept, lane not pretended.</div>
+</div>"""
+    return shell("RF Monitor · watchlist", body, active="watchlist")
+
+
+@router.get("/watchlist", response_class=HTMLResponse)
+def watchlist_page(message: str = Query("")) -> str:
+    return render_watchlist(message)
+
+
+@router.get("/watchlist/promote")
+def watchlist_promote(episode_id: int = Query(...)) -> RedirectResponse:
+    try:
+        entry = rf_watchlist.promote_episode(int(episode_id))
+    except LookupError as exc:
+        raise HTTPException(404, str(exc))
+    note = entry.get("radio") or "no free radio yet"
+    return RedirectResponse("/watchlist?" + urlencode({"message": f"{entry.get('label')} → {note}"}), status_code=303)
+
+
+@router.get("/watchlist/add")
+def watchlist_add(freq_mhz: str = Query(...), label: str = Query("")) -> RedirectResponse:
+    try:
+        freq_hz = int(round(float(freq_mhz) * 1_000_000))
+    except ValueError:
+        raise HTTPException(400, "freq_mhz must be a number")
+    if not 1_000_000 <= freq_hz <= 6_000_000_000:
+        raise HTTPException(400, "frequency outside the radio's range")
+    entry = rf_watchlist.add_entry(freq_hz, label=label.strip() or None, origin="manual")
+    note = entry.get("radio") or "no free radio yet"
+    return RedirectResponse("/watchlist?" + urlencode({"message": f"{entry.get('label')} → {note}"}), status_code=303)
+
+
+@router.get("/watchlist/{entry_id}/toggle")
+def watchlist_toggle(entry_id: int) -> RedirectResponse:
+    entry = rf_watchlist.toggle_entry(int(entry_id))
+    if entry is None:
+        raise HTTPException(404, "no such watchlist entry")
+    return RedirectResponse("/watchlist?" + urlencode(
+        {"message": f"{entry.get('label')} now {'enabled' if entry['enabled'] else 'disabled'}"}), status_code=303)
+
+
+@router.get("/watchlist/{entry_id}/remove")
+def watchlist_remove(entry_id: int) -> RedirectResponse:
+    entry = rf_watchlist.get_entry(int(entry_id))
+    if entry is None:
+        raise HTTPException(404, "no such watchlist entry")
+    rf_watchlist.remove_entry(int(entry_id))
+    return RedirectResponse("/watchlist?" + urlencode({"message": f"removed {entry.get('label')}"}), status_code=303)
 
 
 # --------------------------------------------------------------------------- #
