@@ -61,13 +61,41 @@ the wrong path looks like a broken feed when nothing is broken.
 | units | `lighttpd` active, `tar1090` active |
 | console | `/adsb` 200 embeds tar1090; `/adsb/radar` 200 |
 
-## Known limitation: details are thin with dump1090-mutability
+## Decoder: readsb, not dump1090-mutability (swapped 2026-10-28)
 
-tar1090 gets registration, type and route from the *decoder's* database fields, which
-dump1090-mutability does not emit (upstream notes "aircraft details will be limited").
-So clicking an aircraft gives hex, callsign, altitude, speed, track, and a
-planespotters **photo**, but not registration/type/route. Moving the lane to **readsb**
-would fill those in — a decoder swap, not a UI change.
+The lane runs **readsb 3.16.20** (built from wiedehopf's `dev` branch), not
+dump1090-mutability. Same RTL, same `--gain 49.6`, same JSON directory — the only
+functional difference is `--db-file /usr/local/share/tar1090/aircraft.csv.gz`, which makes
+readsb emit `r` (registration), `t` (type) and `dbFlags`, so tar1090 can show real details.
+
+| | dump1090-mutability | readsb |
+|---|---|---|
+| aircraft with reg/type | **0 of 27** | **17 of 17** |
+| max range | 71–80 km (baseline) | 70.9 km (same ballpark) |
+| units | `dump1090-mutability.service` | `rf-adsb-readsb.service` |
+
+**Field names changed**, which matters for anything reading the JSON directly: readsb
+emits `alt_baro`, `gs` and `r`/`t` where dump1090-mutability emitted `altitude`, `speed`
+and `ground_speed`. Consumers must accept both — `rf_adsb_lane.py` already did;
+`signals_web.py` was patched to fall back to `gs`.
+
+**Rollback** (dump1090's unit is installed but disabled, nothing removed):
+
+```
+sudo systemctl disable --now rf-adsb-readsb
+sudo systemctl enable --now rf-adsb-dump1090
+```
+
+**Rebuild recipe** if readsb ever needs reinstalling: `git clone --depth 1 -b dev
+https://github.com/wiedehopf/readsb`, `make -j$(nproc) RTLSDR=yes` (2 s on LinuxGR),
+install the binary to `/usr/local/bin/readsb`. The aircraft DB is a straight download —
+tar1090's own `git-db/csv.sh` fails because its shallow clone has no `csv` branch:
+
+```
+sudo curl -sL -o /usr/local/share/tar1090/aircraft.csv.gz \
+  https://github.com/wiedehopf/tar1090-db/raw/csv/aircraft.csv.gz
+```
+
 
 Photos also need internet from the *browser* (tiles and planespotters both), which is
 why the radar fallback exists.

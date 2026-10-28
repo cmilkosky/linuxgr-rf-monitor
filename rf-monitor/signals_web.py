@@ -831,7 +831,10 @@ def adsb_snapshot() -> dict[str, Any]:
             "hex": entry.get("hex"),
             "flight": (entry.get("flight") or "").strip(),
             "altitude": entry.get("altitude") or entry.get("alt_baro"),
-            "ground_speed": entry.get("ground_speed"),
+            # readsb emits gs/r/t, dump1090-mutability emitted speed/ground_speed
+            "ground_speed": entry.get("ground_speed") or entry.get("gs"),
+            "registration": entry.get("r"),
+            "type": entry.get("t"),
             "track": entry.get("track"),
             "squawk": entry.get("squawk"),
             "seen": entry.get("seen"),
@@ -876,7 +879,7 @@ def render_adsb() -> str:
   <div class="panel" style="flex:1 1 380px;min-width:320px">
     <h3>Aircraft</h3>
     <div style="max-height:660px;overflow:auto">
-      <table><thead><tr><th>Flight</th><th>Hex</th><th>Alt</th><th>GS</th><th>Dist</th><th>Brg</th></tr></thead>
+      <table><thead><tr><th>Flight</th><th>Reg</th><th>Type</th><th>Alt</th><th>GS</th><th>Dist</th><th>Brg</th></tr></thead>
       <tbody id="rows"></tbody></table>
     </div>
   </div>
@@ -938,11 +941,12 @@ function draw(data) {
   document.getElementById('stamp').textContent =
     `${data.count} aircraft · ${data.positioned} positioned · max ${data.max_range_km} km · ${data.messages} msgs · ${data.generated}`;
   const rows = positioned.slice().sort((a, b) => a.distance_km - b.distance_km).map(a =>
-    `<tr><td>${a.flight || '·'}</td><td class="muted">${a.hex || ''}</td>` +
+    `<tr><td>${a.flight || '·'}</td><td class="muted">${a.registration || ''}</td>` +
+    `<td class="muted">${a.type || ''}</td>` +
     `<td>${a.altitude != null ? Math.round(a.altitude).toLocaleString() + ' ft' : '·'}</td>` +
     `<td>${a.ground_speed != null ? Math.round(a.ground_speed) + ' kt' : '·'}</td>` +
     `<td>${a.distance_km} km</td><td>${Math.round(a.bearing_deg)}°</td></tr>`).join('');
-  document.getElementById('rows').innerHTML = rows || '<tr><td colspan="6" class="muted">no positioned aircraft</td></tr>';
+  document.getElementById('rows').innerHTML = rows || '<tr><td colspan="7" class="muted">no positioned aircraft</td></tr>';
 
   const notice = document.getElementById('notice');
   if (!data.site) {

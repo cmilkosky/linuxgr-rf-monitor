@@ -1,0 +1,33 @@
+[Unit]
+Description=RF Monitor ADS-B demodulator (readsb, 1090 MHz, dedicated RTL)
+Documentation=https://github.com/cmilkosky/linuxgr-rf-monitor
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=cmilkosk
+Group=cmilkosk
+# Runs as cmilkosk, not a packaged user: the RTL device nodes are root:plugdev and
+# cmilkosk is in plugdev, and it must own the JSON files tar1090 serves.
+#
+# Replaced dump1090-mutability on 2026-10-28. Same device, same gain, same JSON
+# directory - the only functional difference is --db-file, which is what makes
+# readsb emit registration (r), type (t) and dbFlags so tar1090 can show details
+# instead of just hex and callsign.
+#
+# --gain 49.6 is deliberately the same max gain the ADS-B baseline was measured at
+# (dump1090's default). readsb's own default is "auto"; do not silently change it.
+# No --net-* flags on purpose: nothing consumes the TCP feeds, tar1090 reads files.
+ExecStart=/usr/local/bin/readsb \
+    --device-type rtlsdr --device 0 \
+    --gain 49.6 \
+    --write-json /home/cmilkosk/rf-monitor/signals/adsb --write-json-every 1 \
+    --db-file /usr/local/share/tar1090/aircraft.csv.gz \
+    --quiet
+Restart=always
+RestartSec=5
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target
