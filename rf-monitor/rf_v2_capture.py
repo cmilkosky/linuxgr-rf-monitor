@@ -414,7 +414,15 @@ def capture_and_analyse(
         tail = remove_dc(read_iq(parts[-1]))[-int(sample_rate_hz * 2):]
         if not signal_present(tail):
             break
-        part = out_dir / f"capture.part{len(parts)}.iq"
+        # The gain ladder already consumed part0..partN, so len(parts) can name a
+        # chunk that is still in `parts` (attempt 1 clipped -> parts == [part1]).
+        # Reusing that name made the concatenation below read, unlink and then
+        # re-read the same file: FileNotFoundError, capture lost. Always take a
+        # name that is not on disk.
+        index = len(parts)
+        while (out_dir / f"capture.part{index}.iq").exists():
+            index += 1
+        part = out_dir / f"capture.part{index}.iq"
         meta = capture_hackrf(tune_hz, part, duration_seconds=base_seconds,
                               sample_rate_hz=sample_rate_hz, lna_gain_db=gains[0],
                               vga_gain_db=gains[1], device_serial=device_serial, lock_path=lock_path)
@@ -425,7 +433,9 @@ def capture_and_analyse(
         parts[0].replace(iq_path)
     else:
         with open(iq_path, "wb") as handle:
-            for part in parts:
+            for part in dict.fromkeys(parts):   # dedupe: one read per file
+                if not part.exists():
+                    raise RuntimeError(f"capture chunk vanished before concat: {part.name}")
                 handle.write(part.read_bytes())
                 part.unlink(missing_ok=True)
     iq = remove_dc(read_iq(iq_path))
