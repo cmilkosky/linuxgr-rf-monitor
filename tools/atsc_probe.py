@@ -31,6 +31,14 @@ Two consequences. The capture rate must be the ATSC symbol rate (~10.762 MS/s, i
 HackRF's 2-20 MS/s range), NOT 6.25 MS/s: at 6.25 MS/s this chain cannot decode even a
 perfect signal, so every earlier live "no lock" measured nothing about the station. And
 pure noise still yields 0 bytes, so a lock means a real signal was decoded.
+
+What the loopback proves, exactly: the receive chain locks, demaps, RS-decodes and emits a
+playable MPEG-2 + AC-3 transport stream (1280x720, timestamp overlay readable). It does NOT
+prove a clean link - every frame carries macroblock errors (162 damaged-macroblock lines
+across ~90 frames in a 3 s decode, at t=0.5/1.0/1.5/2.0 s alike, so it is not just
+acquisition). sps 1.0 gives a parseable header-less stream, sps 2.0 the best result, and
+2x-oversampled input nothing at all, so this modulator and gr-dtv's receiver are not
+perfectly matched. A live lock is therefore evidence of a station, not of picture quality.
 """
 
 from __future__ import annotations
