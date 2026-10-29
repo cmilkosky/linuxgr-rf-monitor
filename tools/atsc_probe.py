@@ -14,17 +14,23 @@ the probe says so; a TV picture only appears if there is a real station to lock 
 
     python3 tools/atsc_probe.py --freq 569 --seconds 10
     python3 tools/atsc_probe.py --freq 66 --seconds 10 --frame
-    python3 tools/atsc_probe.py --iq-file capture.cfile     # decode a saved 6.25 MS/s capture
+    python3 tools/atsc_probe.py --iq-file capture.cfile [--iq-rate 10.762] [--iq-sps 2.0]
     python3 tools/atsc_probe.py --loopback                  # synthetic signal, no station needed
 
-Loopback status, 2026-10-28: gr-dtv 3.10 on LinuxGR ships the ATSC sub-blocks but no
-`dtv.atsc_tx`, so the transmitter here is composed from its own file_atsc_tx.grc chain.
-It runs and emits 6.25 MS/s IQ (RMS 0.38), but atsc_rx does not lock on it at any sps
-tried (1.5, 0.5809, 2.0, 1.0, 0.5), and its spectrum is a DC spike 33 dB above a flat
-plateau - i.e. not a valid 8-VSB signal. So the loopback does NOT yet prove the receive
-chain; it is the harness for that test, not the proof. The noise control does behave
-(pure noise -> 0 bytes out), so a locked station would still show up as real TS bytes.
-Until a real capture or a correct transmitter settles it, treat the decoder as unproven.
+Receive chain PROVEN 2026-10-29, not assumed. gr-dtv 3.10 ships no ATSC transmitter (its
+`dvbs2_modulator_bc(MOD_8VSB)` is only an 8PSK symbol map, so composing one from the
+gr-dtv sub-blocks yields a signal that looks plausible and never locks), so --loopback
+builds the philburr/atsc reference modulator and feeds its output to `atsc_rx`:
+
+    10.762237 MS/s, sps 2.0  -> LOCK, mpeg2video 1280x720 + ac3
+    10.762237 MS/s, sps 1.0  -> streams, 0x0 dimensions (header not clean)
+    21.524 MS/s (2x), sps 2.0 -> streams, 0x0; sps 1.0 -> nothing
+     6.25 MS/s, sps 1.5 / 0.5809 / 0.5 -> nothing at all
+
+Two consequences. The capture rate must be the ATSC symbol rate (~10.762 MS/s, inside the
+HackRF's 2-20 MS/s range), NOT 6.25 MS/s: at 6.25 MS/s this chain cannot decode even a
+perfect signal, so every earlier live "no lock" measured nothing about the station. And
+pure noise still yields 0 bytes, so a lock means a real signal was decoded.
 """
 
 from __future__ import annotations
@@ -57,14 +63,20 @@ for _candidate in (_HERE.parents[1] / "rf-monitor", _HERE.parents[1], _HERE.pare
 
 import rf_v2_capture  # noqa: E402
 
-SAMPLE_RATE_HZ = 6_250_000  # what gr-dtv's file_atsc_rx.grc expects
-SPS = 1.5
+SAMPLE_RATE_HZ = 6_250_000  # legacy: kept only so old callers still import
 DEVICE_ENV = "RF_CAPTURE_DEVICE_SERIAL"
-# gr-dtv 3.10 ships the ATSC transmit blocks (pad, randomizer, RS, interleaver, trellis,
-# field-sync mux) and MOD_8VSB in dvbs2_modulator_bc, but no monolithic `dtv.atsc_tx`.
-# The chain below mirrors its own example, /usr/share/gnuradio/examples/dtv/file_atsc_tx.grc.
-ATSC_SYMBOL_RATE = 4.5e6 / 286 * 684          # 10.762 MSym/s
-LOOPBACK_TS_SECONDS = 1.0   # ~170 MB of IQ and ~1 min of demod - enough for field-sync lock
+# Measured 2026-10-29 against a reference transmitter (philburr/atsc, a real ATSC 8VSB
+# modulator): atsc_rx locks ONLY when the input rate matches the ATSC symbol rate.
+#   10.762237 MS/s, sps 2.0 -> full 1280x720 mpeg2video + ac3
+#   10.762237 MS/s, sps 1.0 -> streams but 0x0 (sequence header not clean)
+#   21.524 MS/s (2x), sps 2.0 -> streams but 0x0; sps 1.0 -> nothing
+#    6.25 MS/s, sps 1.5 / 0.5809 / 0.5 -> nothing at all
+# So the old 6.25 MS/s + sps 1.5 setting could never decode, even on a perfect signal.
+ATSC_SYMBOL_RATE = 4.5e6 / 286 * 684          # 10.762237 MS/s
+CAPTURE_RATE_HZ = int(round(ATSC_SYMBOL_RATE))
+CAPTURE_SPS = 2.0
+REF_TX_DIR = Path(os.environ.get("ATSC_REF_TX_DIR", "/tmp/atsc-ref"))
+LOOPBACK_TS_SECONDS = 1.0
 
 
 def device_serial() -> str:
@@ -81,7 +93,7 @@ def capture(freq_hz: int, seconds: float, workdir: Path) -> tuple[Path, Path]:
     rf_v2_capture.capture_hackrf(
         freq_hz, cu8,
         duration_seconds=seconds,
-        sample_rate_hz=SAMPLE_RATE_HZ,
+        sample_rate_hz=CAPTURE_RATE_HZ,
         device_serial=device_serial(),
         lock_path=rf_v2_capture.PORTAPACK_LOCK_PATH,
     )
@@ -91,7 +103,8 @@ def capture(freq_hz: int, seconds: float, workdir: Path) -> tuple[Path, Path]:
     return cf32, cu8
 
 
-def demodulate(cf32: Path, ts: Path) -> dict:
+def demodulate(cf32: Path, ts: Path, rate: float = CAPTURE_RATE_HZ,
+               sps: float = CAPTURE_SPS) -> dict:
     """Run gr-dtv's ATSC receive pipeline over the capture."""
     from gnuradio import blocks, dtv, gr
 
@@ -99,7 +112,7 @@ def demodulate(cf32: Path, ts: Path) -> dict:
         def __init__(self) -> None:
             gr.top_block.__init__(self, "atsc_rx")
             src = blocks.file_source(gr.sizeof_gr_complex, str(cf32), False)
-            rx = dtv.atsc_rx(SAMPLE_RATE_HZ, SPS)
+            rx = dtv.atsc_rx(rate, sps)
             sink = blocks.file_sink(gr.sizeof_char, str(ts), False)
             self.connect(src, rx, sink)
 
@@ -117,6 +130,7 @@ def make_source_ts(ts: Path, seconds: float) -> dict:
          "-c:v", "mpeg2video", "-b:v", "12M", "-minrate", "12M", "-maxrate", "12M",
          "-bufsize", "1M", "-g", "15",
          "-c:a", "ac3", "-b:a", "192k",
+         "-muxrate", "19393000",          # the modulator needs a 19.39 Mbit/s TS
          "-f", "mpegts", str(ts)],
         capture_output=True, text=True, timeout=300,
     )
@@ -125,44 +139,51 @@ def make_source_ts(ts: Path, seconds: float) -> dict:
     return {"source_ts_bytes": ts.stat().st_size}
 
 
+def build_reference_tx() -> Path:
+    """Compile the philburr/atsc reference modulator (real 8VSB: randomizer, RS(207,187),
+    interleaver, trellis, field sync, RRC, pilot). gr-dtv 3.10 has no ATSC transmitter -
+    its `MOD_8VSB` is just an 8PSK map - so a loopback needs this one. Cached in REF_TX_DIR."""
+    binary = REF_TX_DIR / "atsc_encoder_file"
+    if binary.exists():
+        return binary
+    src_dir = REF_TX_DIR / "atsc"
+    REF_TX_DIR.mkdir(parents=True, exist_ok=True)
+    if not (src_dir / ".git").exists():
+        clone = subprocess.run(["git", "clone", "--depth", "1",
+                                "https://github.com/philburr/atsc.git", str(src_dir)],
+                               capture_output=True, text=True, timeout=300)
+        if clone.returncode != 0:
+            raise RuntimeError(f"could not clone philburr/atsc: {clone.stderr[-300:]}")
+    harness = Path(__file__).resolve().parent / "atsc_ref_tx.cpp"
+    if not harness.exists():
+        raise RuntimeError(f"reference harness missing: {harness}")
+    build = subprocess.run(
+        ["g++", "-O2", "-std=c++17", "-mavx2", "-mfma", "-DHAVE_FMA=1",
+         "-I", str(src_dir / "src"), str(harness), str(src_dir / "src/atsc/atsc.cpp"),
+         "-o", str(binary)],
+        capture_output=True, text=True, timeout=300,
+    )
+    if build.returncode != 0 or not binary.exists():
+        raise RuntimeError(f"could not build reference modulator: {build.stderr[-400:]}")
+    return binary
+
+
 def transmit(ts_in: Path, cf32: Path) -> dict:
-    """8-VSB modulate a TS to complex64 at SAMPLE_RATE_HZ - no radio involved."""
-    from gnuradio import blocks, dtv, filter, gr
-    from gnuradio.filter import firdes
-
-    symbol_rate = ATSC_SYMBOL_RATE
-    taps = firdes.root_raised_cosine(0.11, symbol_rate, symbol_rate / 2, 0.1152, 200)
-
-    class Tx(gr.top_block):
-        def __init__(self) -> None:
-            gr.top_block.__init__(self, "atsc_tx")
-            src = blocks.file_source(gr.sizeof_char, str(ts_in), False)
-            chain = [
-                dtv.atsc_pad(),
-                dtv.atsc_randomizer(),
-                dtv.atsc_rs_encoder(),
-                dtv.atsc_interleaver(),
-                dtv.atsc_trellis_encoder(),
-                dtv.atsc_field_sync_mux(),
-                blocks.vector_to_stream(gr.sizeof_char, 1024),
-                blocks.keep_m_in_n(gr.sizeof_char, 832, 1024, 4),
-                dtv.dvbs2_modulator_bc(dtv.FECFRAME_NORMAL, dtv.C1_4,
-                                       dtv.MOD_8VSB, dtv.INTERPOLATION_OFF),
-                filter.fft_filter_ccc(1, taps),
-                # 10.762 MSym/s -> 6.25 MS/s, the rate atsc_rx is told to expect.
-                filter.rational_resampler_ccc(625, 1076),
-            ]
-            sink = blocks.file_sink(gr.sizeof_gr_complex, str(cf32), False)
-            self.connect(src, *chain, sink)
-
-    Tx().run()
-    return {"tx_bytes": cf32.stat().st_size if cf32.exists() else 0}
+    """8-VSB modulate a TS to complex64 at the ATSC symbol rate - no radio involved."""
+    binary = build_reference_tx()
+    proc = subprocess.run([str(binary), str(ts_in), str(cf32)],
+                          capture_output=True, text=True, timeout=600)
+    if proc.returncode != 0 or not cf32.exists():
+        raise RuntimeError(f"reference modulator failed: {proc.stderr[-300:]}")
+    return {"tx_bytes": cf32.stat().st_size,
+            "tx_rate_hz": CAPTURE_RATE_HZ,
+            "tx_summary": (proc.stdout or "").strip()[-160:]}
 
 
 def noise_control(cf32: Path, ts: Path, seed: int = 11) -> dict:
     """Negative control: the same receive chain over pure noise must NOT produce a stream."""
     rng = np.random.default_rng(seed)
-    samples = int(SAMPLE_RATE_HZ * 1.0)
+    samples = int(CAPTURE_RATE_HZ * 1.0)
     noise = (rng.normal(0, 0.05, samples) + 1j * rng.normal(0, 0.05, samples)).astype(np.complex64)
     noise.tofile(cf32)
     out = demodulate(cf32, ts)
@@ -219,7 +240,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--keep", action="store_true", help="keep the working files")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--iq-file", type=Path,
-                        help="decode an existing complex64 capture at 6.25 MS/s instead of the radio")
+                        help="decode an existing complex64 capture instead of the radio")
+    parser.add_argument("--iq-rate", type=float, default=CAPTURE_RATE_HZ / 1e6,
+                        help="sample rate of --iq-file in MHz (default: ATSC symbol rate)")
+    parser.add_argument("--iq-sps", type=float, default=CAPTURE_SPS,
+                        help="samples per symbol for atsc_rx (default 2.0, measured)")
     parser.add_argument("--loopback", action="store_true",
                         help="prove the receive chain on a synthetic ATSC signal, no station needed")
     args = parser.parse_args(argv)
@@ -227,11 +252,13 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--freq is required unless --loopback or --iq-file is given")
 
     workdir = Path(tempfile.mkdtemp(prefix="atsc-probe-"))
-    report: dict = {"sample_rate_hz": SAMPLE_RATE_HZ, "sps": SPS}
+    report: dict = {"sample_rate_hz": CAPTURE_RATE_HZ, "sps": CAPTURE_SPS}
     try:
         if args.loopback:
             report.update(loopback(workdir, args.frame))
         else:
+            rate = args.iq_rate * 1e6
+            sps = args.iq_sps
             if args.iq_file:
                 cf32 = args.iq_file.expanduser().resolve()
                 if not cf32.exists():
@@ -241,13 +268,20 @@ def main(argv: list[str] | None = None) -> int:
                 freq_hz = int(args.freq * 1e6)
                 report.update({"freq_mhz": args.freq, "seconds": args.seconds})
                 cf32, _ = capture(freq_hz, args.seconds, workdir)
+            report["sample_rate_hz"] = rate
+            report["sps"] = sps
             report["capture_bytes"] = cf32.stat().st_size
             ts = workdir / "mpeg.ts"
-            report.update(demodulate(cf32, ts))
+            report.update(demodulate(cf32, ts, rate=rate, sps=sps))
             report.update(probe_ts(ts, args.frame))
         if report.get("frame"):
-            dest = Path.cwd() / ("atsc-%s.png" % (
-                "loopback" if args.loopback else "%.3fMHz" % args.freq))
+            if args.loopback:
+                tag = "loopback"
+            elif args.iq_file:
+                tag = args.iq_file.stem
+            else:
+                tag = "%.3fMHz" % args.freq
+            dest = Path.cwd() / ("atsc-%s.png" % tag)
             shutil.copy(report["frame"], dest)
             report["frame"] = str(dest)
     finally:
