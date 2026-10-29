@@ -37,7 +37,8 @@ TYPE_SECTIONS: list[tuple[str, str, tuple[str, ...]]] = [
     ("voice", "VOICE", ("voice",)),
     ("music", "MUSIC", ("music",)),
     ("ism", "ISM SENSORS / RTL_433", ("ism",)),
-    ("text", "AIRCRAFT / APRS / PAGER TEXT", ("aircraft", "aprs", "pager")),
+    ("text", "AIRCRAFT / APRS / PAGER / DIGITAL TEXT",
+     ("aircraft", "aprs", "pager", "ft8", "ft4", "acars", "ais")),
     ("satellite", "SATELLITE IMAGES", ("satellite",)),
 ]
 
@@ -48,7 +49,7 @@ SECTION_CHOICES = [
     ("voice", "Voice"),
     ("music", "Music"),
     ("ism", "ISM sensors"),
-    ("text", "Aircraft / APRS / pager text"),
+    ("text", "Aircraft / APRS / pager / FT8 / FT4 / ACARS / AIS text"),
     ("satellite", "Satellite images"),
 ]
 
@@ -373,7 +374,7 @@ def _filter_args(
     if section in ("voice", "music", "ism", "satellite"):
         kwargs["decode_type"] = section
     elif section == "text":
-        kwargs["decode_types"] = ["aircraft", "aprs", "pager"]
+        kwargs["decode_types"] = ["aircraft", "aprs", "pager", "ft8", "ft4", "acars", "ais"]
     if decode_type:
         kwargs["decode_type"] = decode_type
     if klass:
@@ -434,7 +435,8 @@ def render_table(
   <label>Type<select name="decode_type">
     <option value=""{" selected" if not decode_type else ""}>any</option>
     {option_list([("voice","voice"),("music","music"),("ism","ism"),("aircraft","aircraft"),
-                  ("aprs","aprs"),("pager","pager"),("satellite","satellite")], decode_type)}
+                  ("aprs","aprs"),("pager","pager"),("satellite","satellite"),
+                  ("ft8","ft8"),("ft4","ft4"),("acars","acars"),("ais","ais")], decode_type)}
   </select></label>
   <label>Class<select name="class">
     <option value=""{" selected" if not klass else ""}>any</option>

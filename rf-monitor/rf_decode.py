@@ -91,6 +91,10 @@ PROTOCOL_TYPES: dict[str, tuple[str, str]] = {
     "POCSAG2400": ("pager", "POCSAG 2400 pager"),
     "FLEX": ("pager", "FLEX pager"),
     "EAS": ("voice", "NOAA EAS / SAME weather alert"),
+    "FT8": ("ft8", "FT8 weak-signal (2 m / 70 cm / 6 m)"),
+    "FT4": ("ft4", "FT4 weak-signal (2 m / 70 cm / 6 m)"),
+    "ACARS": ("acars", "ACARS aircraft datalink"),
+    "AIS": ("ais", "AIS ship transponder"),
 }
 
 # multimon-ng wants 22050 Hz signed-16-bit mono for the 1200 Bd decoders.
@@ -450,7 +454,21 @@ def decode_episode(
                 f"{time.monotonic() - t0:.2f}s {errors[-1] if errors else ''}".strip(),
                 started, dry_run)
 
-    # 2) the audio artifacts the capture already wrote
+    # 2) band-gated external decoders: APRS, FT8/FT4, ACARS, AIS. They need raw
+    # IQ (they do their own demodulation), so an audio-only backfill skips them.
+    if iq is not None and sample_rate_hz and not hits:
+        try:
+            import rf_decode_ext
+            start_epoch = time.time() - (len(iq) / float(sample_rate_hz))
+            for name, status, detail, found in rf_decode_ext.decode_external(
+                    iq, sample_rate_hz, center_hz or freq_hz, freq_hz, start_epoch):
+                tried.append(name)
+                hits.extend(found)
+                _record(episode_id, name, status, detail, started, dry_run)
+        except Exception as exc:  # a decoder fault must never kill the capture
+            errors.append(f"external: {exc}"[:300])
+
+    # 3) the audio artifacts the capture already wrote
     by_kind = {str(a["kind"]): a for a in (artifacts or []) if a.get("kind")}
     for mode in audio_modes:
         if hits:
