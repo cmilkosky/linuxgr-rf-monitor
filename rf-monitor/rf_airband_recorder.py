@@ -39,20 +39,23 @@ import signals_store as store
 
 START_HZ = int(float(os.environ.get("RF_AIRBAND_START_HZ", 108_000_000)))
 STOP_HZ = int(float(os.environ.get("RF_AIRBAND_STOP_HZ", 137_000_000)))
-CHUNK_RATE = int(float(os.environ.get("RF_AIRBAND_RATE_HZ", 8_000_000)))
-DWELL_S = float(os.environ.get("RF_AIRBAND_DWELL_S", 6.0))
+CHUNK_RATE = int(float(os.environ.get("RF_AIRBAND_RATE_HZ", 2_000_000)))
+DWELL_S = float(os.environ.get("RF_AIRBAND_DWELL_S", 20.0))
 CHANNEL_HZ = float(os.environ.get("RF_AIRBAND_CHANNEL_HZ", 25_000))
 SHORTLIST = int(os.environ.get("RF_AIRBAND_SHORTLIST", 8))
 SIGNAL_RATIO = float(os.environ.get("RF_AIRBAND_SIGNAL_RATIO", 1.8))
 SIDEBAND_MIN = float(os.environ.get("RF_AIRBAND_SIDEBAND_MIN", 0.008))
 SIDEBAND_MAX = float(os.environ.get("RF_AIRBAND_SIDEBAND_MAX", 0.6))
 DYN_MIN_DB = float(os.environ.get("RF_AIRBAND_DYN_MIN_DB", 12.0))
-QUIET_MIN = float(os.environ.get("RF_AIRBAND_QUIET_MIN", 0.02))
+QUIET_MIN = float(os.environ.get("RF_AIRBAND_QUIET_MIN", 0.0))  # off by default:
+# continuous speech in a 6 s window has no 20 dB-deep gaps, so this gate only ever
+# rejected real transmissions. Dynamic range alone separates voice from hum/noise.
 MOD_MIN = float(os.environ.get("RF_AIRBAND_MOD_MIN", 0.30))
 SPEECH_MIN = float(os.environ.get("RF_AIRBAND_SPEECH_MIN", 0.10))
 COOLDOWN_S = float(os.environ.get("RF_AIRBAND_COOLDOWN_S", 120))
 MAX_PER_CYCLE = int(os.environ.get("RF_AIRBAND_MAX_PER_CYCLE", 3))
 MIN_CLIP_S = float(os.environ.get("RF_AIRBAND_MIN_CLIP_S", 0.5))
+LEVEL_MIN_DB = float(os.environ.get("RF_AIRBAND_LEVEL_MIN_DB", 6.0))
 LNA = int(float(os.environ.get("RF_AIRBAND_LNA_DB", 32)))
 VGA = int(float(os.environ.get("RF_AIRBAND_VGA_DB", 24)))
 IDLE_S = float(os.environ.get("RF_AIRBAND_IDLE_S", 2.0))
@@ -209,9 +212,9 @@ def _record(iq, rate, center_hz, freq_hz, audio, mod, speech, level_db) -> bool:
     info = cap.write_wav(audio, wav)
     cap._to_mp3(wav, wav.with_suffix(".mp3"))
     store.add_artifact(episode_id, "audio-am", wav, size=info["bytes"])
-    store.mark_decoded(episode_id, "voice",
-                       f"AM voice {audio.size / 48000:.1f}s @ {freq_hz / 1e6:.3f} MHz "
-                       f"(mod {mod:.2f}, speech {speech:.2f})")
+    store.mark_decoded(episode_id, "aircraft",
+                       f"AM audio {audio.size / 48000:.1f}s @ {freq_hz / 1e6:.3f} MHz "
+                       f"(+{level_db:.0f} dB, mod {mod:.2f}) - listen to confirm voice")
     store.record_attempt(episode_id, "airband-recorder", "ok",
                          f"{audio.size / 48000:.1f}s audio mod={mod:.2f} speech={speech:.2f}")
     log(f"RECORDED ep{episode_id} {freq_hz / 1e6:.3f} MHz {audio.size / 48000:.1f}s "
@@ -250,6 +253,8 @@ def cycle(centers: list[int] | None = None) -> int:
                     f"dyn={m['dyn_db']:.1f}dB quiet={m['quiet']:.2f} speech={m['speech']:.2f}")
                 if not (SIDEBAND_MIN <= side <= SIDEBAND_MAX):
                     continue
+                if level_db < LEVEL_MIN_DB:
+                    continue          # 3-9 dB above the floor is receiver noise, not a station
                 if m["dyn_db"] < DYN_MIN_DB or m["quiet"] < QUIET_MIN:
                     continue
                 if _record(iq, CHUNK_RATE, center, freq, audio, m["mod"], m["speech"], level_db):
