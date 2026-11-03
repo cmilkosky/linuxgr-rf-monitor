@@ -88,3 +88,40 @@ After any change, re-run the same two queries and compare max/p90 range and
 aircraft count. A full-day baseline (24 h) is the right unit; the window above is
 2.2 h, so expect the daily max to be somewhat higher simply from more time in the
 sample.
+
+## 2026-11-02: dedicated FlightAware 1090 antenna on a third RTL (AFTER)
+
+Chain changed to: **FlightAware dual-band 1090/978 omni (6 dBi, N-female, passive,
+no LNA) → 32 ft N-male→SMA-male cable → Nooelec NESDR SMArt v5 (USB serial
+`RTL0`, hub port 7-1.1.3) → readsb, gain 49.6**. The D3000N/MCA204M feed stays on
+RTL3 as a spare. Antenna was *not* in its final position (indoors/marginal spot).
+
+Simultaneous A/B, both receivers running at the same instant, 2026-11-02 EST:
+
+| Same instant | New (1090 ant, RTL0) | Old (D3000N, RTL3) |
+|---|---|---|
+| 20:34:35 aircraft | **30** (24 positioned) | 8 (6) |
+| max / p90 / median range | **96.4 / 75.7 / 40.9 km** | 24.6 / 24.0 / 20.0 km |
+| message rate | **166.6 msg/s** | 13.8 msg/s |
+| 20:40:35 aircraft | **30** (26) | 8 (7) |
+| max / p90 / median range | **126.7 / 61.4 / 36.7 km** | 37.0 / 31.5 / 23.8 km |
+| message rate | **161.7 msg/s** | 19.3 msg/s |
+
+Set relationship both samples: the new radio heard **every** aircraft the old chain
+heard (8/8) plus 22 more, never fewer. 126.7 km already exceeds the 71–80 km
+ceiling of the D3000N chain. Production cut over at 21:01 EST and read 25–26
+aircraft / max 112.7 km / 140.9 msg/s a minute later.
+
+Remaining lever, unchanged from the analysis above: the 32 ft of cable at 1090 MHz
+costs several dB ahead of a gain-starved RTL, so a mast-mounted 1090 LNA is still
+the next real win. The antenna is dual-band 1090/978, so UAT 978 reception is also
+available with a second dongle.
+
+## Pin by serial, never by index
+
+Adding the third dongle re-ordered libusb indices (0=RTL3, 1=RTL0, 2=RTL2) and
+silently moved `rf-hopper` (`RF_HOPPER_DEVICE=1`) onto the new radio — it spent its
+dwells on a 1090 antenna hearing nothing. readsb takes `--device <index|serial>`,
+so the lane is pinned `--device RTL0`; `rtl_sdr` only takes an index, so the
+hopper's env index must be re-checked after any USB add/remove/re-plug.
+
