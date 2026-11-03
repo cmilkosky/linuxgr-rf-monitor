@@ -12,6 +12,11 @@ WorkingDirectory=/home/cmilkosk/rf-monitor
 # Runs as cmilkosk for the same reason readsb does: the RTL device nodes are
 # root:plugdev and cmilkosk is in plugdev, and the episodes/artifacts are its files.
 EnvironmentFile=-/home/cmilkosk/.config/rf-hopper.env
+# RF_HOPPER_DEVICE in that env file is a libusb INDEX, and rtl_sdr (which the
+# hopper shells out to) has no serial option - so this pin does not survive a
+# dongle being added or re-plugged. As of 2026-11-02 it must be 2 (= SN RTL2 on
+# the D3000N feed); index 1 is now SN RTL0, the dedicated ADS-B dongle. Re-read
+# `rtl_test -t` after any USB change, and check the hopper log for non-zero SNR.
 ExecStart=/usr/bin/python3 /home/cmilkosk/rf-monitor/rf_hopper.py --loop
 Restart=always
 RestartSec=10
