@@ -270,6 +270,28 @@ def _contiguous(indexes: np.ndarray) -> list[np.ndarray]:
     return np.split(indexes, breaks)
 
 
+MAX_BLOB_BINS = int(os.environ.get("RF_SCOUT_MAX_BLOB_BINS", "20"))
+
+
+def _narrow(group: np.ndarray, delta: np.ndarray, max_bins: int) -> np.ndarray:
+    """Keep a wide run of adjacent candidate bins from becoming one giant blob.
+
+    A broad rise in the noise floor lights up every bin at once, and `_contiguous`
+    then hands back a single group hundreds of bins wide. Those rows carry no
+    frequency information (measured: a 347 MHz "episode" at 1 MHz/bin) and they
+    outrank real carriers because strength is averaged over the blob. Keep only the
+    strongest `max_bins` window of the run, so one broad rise yields one row
+    centred where the energy actually is. 20 bins at 1 MHz still covers Wi-Fi and
+    a 20 MHz LTE carrier.
+    """
+    if max_bins <= 0 or group.size <= max_bins:
+        return group
+    vals = np.nan_to_num(delta[group].astype(np.float64), nan=0.0)
+    roll = np.convolve(vals, np.ones(max_bins) / max_bins, mode="valid")
+    start = int(np.argmax(roll))
+    return group[start:start + max_bins]
+
+
 def detect_blobs(
     floor: dict[int, float],
     recent: list[tuple[str, int, float]],
@@ -324,6 +346,7 @@ def detect_blobs(
 
     blobs: list[dict[str, Any]] = []
     for group in _contiguous(indexes):
+        group = _narrow(group, delta, MAX_BLOB_BINS)
         seg = slice(int(group[0]), int(group[-1]) + 1)
         seg_freqs = freqs[seg].astype(np.float64)
         seg_delta = delta[seg].astype(np.float64)
