@@ -1,0 +1,12 @@
+[Unit]
+Description=Check the LinuxGR RF feed every 5 minutes
+Documentation=file:///home/cmilkosk/rf-monitor/rf_feed_watchdog.py
+
+[Timer]
+OnBootSec=180
+OnUnitActiveSec=300
+AccuracySec=30
+Unit=rf-feed-watchdog.service
+
+[Install]
+WantedBy=timers.target

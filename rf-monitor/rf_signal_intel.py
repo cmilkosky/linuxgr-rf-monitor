@@ -189,7 +189,11 @@ def extract_iq_features(iq: Any, sample_rate_hz: int, center_frequency_hz: int) 
         traits.append("continuous")
     if spectral_flatness > 0.55:
         traits.append("noise_like_or_spread")
-    if inst_freq_std_hz > max(50_000, occupied_hz * 0.2):
+    # White noise has a random instantaneous frequency, so inst_freq_std alone called
+    # every noise blob "chirp_like" and the lane captured it as "Radar / FMCW sweep
+    # candidate" (ep36778 at 151.6 MHz: flatness 0.93, no carrier anywhere). A real
+    # sweep is coherent, so require a non-flat spectrum before calling it a chirp.
+    if spectral_flatness <= 0.55 and inst_freq_std_hz > max(50_000, occupied_hz * 0.2):
         traits.append("chirp_like")
     if peak_count >= 3 and occupied_hz < 500_000:
         traits.append("structured_digital")

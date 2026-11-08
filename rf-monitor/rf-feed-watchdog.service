@@ -1,0 +1,12 @@
+[Unit]
+Description=Alarm when the LinuxGR RF sweep goes dead (feed/coax off, or all bins at floor)
+After=network-online.target influxdb.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=cmilkosk
+WorkingDirectory=/home/cmilkosk/rf-monitor
+Environment=RF_MONITOR_ENV=/home/cmilkosk/.config/hackrf-influx.env
+Environment=HASS_ENV=/home/cmilkosk/.config/cowrie/ha.env
+ExecStart=/usr/bin/python3 /home/cmilkosk/rf-monitor/rf_feed_watchdog.py

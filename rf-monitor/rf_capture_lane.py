@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 from datetime import datetime, timezone
@@ -56,6 +57,12 @@ MIN_SCORE = float(os.environ.get("RF_LANE_MIN_SCORE", "60"))
 MAX_PER_RUN = int(os.environ.get("RF_LANE_MAX_PER_RUN", "1"))
 INTERVAL = float(os.environ.get("RF_LANE_INTERVAL", "60"))
 DEVICE_SERIAL = os.environ.get("RF_CAPTURE_DEVICE_SERIAL", "").strip()
+# A dwell that lands on nothing but the receiver's own noise is not a recording of
+# anything: it fills the artifact store with static and gets mislabelled as a chirp.
+# Blank captures are dropped (class='noise') instead of being kept and decoded.
+NOISE_FLATNESS = float(os.environ.get("RF_NOISE_FLATNESS", "0.80"))
+NOISE_WIDE_HZ = int(os.environ.get("RF_NOISE_WIDE_HZ", "1500000"))
+NOISE_PURGE = os.environ.get("RF_NOISE_PURGE", "1").strip().lower() not in ("0", "false", "no")
 SPUR_MASK = tuple(
     int(part) for part in os.environ.get("RF_LANE_SPUR_MASK", "89000000,101500000").split(",")
     if part.strip().isdigit()
@@ -149,6 +156,21 @@ def record_bundle(episode: dict[str, Any], bundle: dict[str, Any], capture_id: s
     return {"intel": intel, "decoded": decoded, "artifacts": len(stored)}
 
 
+def is_blank_capture(features: dict[str, Any]) -> bool:
+    """True when the dwell found nothing but the receiver's own noise.
+
+    ep36778 sat at 151.6 MHz with spectral flatness 0.93 across 5 MHz and no carrier
+    anywhere in the spectrum, yet it was stored and labelled "Radar / FMCW sweep
+    candidate". Flat *and* wide is noise: a real emitter leaves structure.
+    """
+    try:
+        flatness = float(features.get("spectral_flatness") or 0.0)
+        occupied = int(features.get("occupied_bandwidth_hz") or 0)
+    except (TypeError, ValueError):
+        return False
+    return flatness >= NOISE_FLATNESS and occupied >= NOISE_WIDE_HZ
+
+
 def capture_one(episode: dict[str, Any], *, dwell: float, max_dwell: float,
                 serial: str, spur_mask: tuple[int, ...]) -> dict[str, Any]:
     """Capture + decode a single episode on the pinned radio."""
@@ -195,6 +217,19 @@ def capture_one(episode: dict[str, Any], *, dwell: float, max_dwell: float,
            if decoded["status"] == "decoded" else "")
         + f" in {elapsed:.1f}s"
     )
+    if NOISE_PURGE and is_blank_capture(bundle.get("features") or {}) and decoded["status"] != "decoded":
+        with store.connect() as conn:
+            conn.execute(
+                "UPDATE episodes SET class='noise', decode_status='rejected', decoded_summary=?"
+                " WHERE id=?",
+                ("blank capture: flat wideband noise, no carrier in the dwell", episode_id),
+            )
+            conn.commit()
+        shutil.rmtree(out_dir, ignore_errors=True)
+        log(f"ep{episode_id} {freq_mhz:.3f} MHz blank (flatness "
+            f"{(bundle.get('features') or {}).get('spectral_flatness')}) - purged, nothing recorded")
+        return {"episode_id": episode_id, "status": "blank", "decode": decoded["status"],
+                "seconds": round(elapsed, 1)}
     return {"episode_id": episode_id, "status": "captured", "dwell": dwell_actual,
             "decode": decoded["status"], "decode_type": decoded.get("decode_type"),
             "summary": decoded.get("summary"), "seconds": round(elapsed, 1)}
