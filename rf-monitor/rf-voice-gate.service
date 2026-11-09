@@ -1,0 +1,33 @@
+[Unit]
+Description=RF voice-presence gate (Silero VAD v5, CPU, loopback only)
+Documentation=https://hermes-agent.nousresearch.com/docs
+After=network.target
+
+[Service]
+Type=simple
+User=rfvoice
+Group=rfvoice
+Environment=VOICE_HOST=127.0.0.1
+Environment=VOICE_PORT=10505
+Environment=SILERO_MODEL=/opt/rf-voice-gate/silero_vad.onnx
+Environment=VOICE_GATE_MIN_PCT=1.0
+ExecStart=/opt/rf-voice-gate/venv/bin/python /opt/rf-voice-gate/rf_voice_gate_server.py
+Restart=always
+RestartSec=3
+
+# Unprivileged, no login, no writable system paths, no home access:
+# the lanes POST audio bytes, so this never needs to read their files.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target
