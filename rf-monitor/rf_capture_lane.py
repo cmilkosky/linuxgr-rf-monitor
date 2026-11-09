@@ -47,6 +47,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import rf_voice_gate as voice_gate
 import signals_store as store
 
 LOG_PREFIX = "rf_capture_lane"
@@ -141,6 +142,18 @@ def record_bundle(episode: dict[str, Any], bundle: dict[str, Any], capture_id: s
             store.add_artifact(episode_id, f"audio-{mode}", info["wav"], info.get("bytes") or 0)
             stored.append({"kind": f"audio-{mode}", "path": info["wav"]})
 
+    # Silero VAD verdict on the demodulated audio: the only stage of this lane that
+    # actually listens for a human voice. It labels, it does not gate - a VAD outage
+    # or disagreement must never discard a capture the radio already made.
+    vad = None
+    for art in stored:
+        if str(art.get("kind", "")).startswith("audio-"):
+            vad = voice_gate.gate_file(art["path"])
+            if vad and vad.get("gate_pass"):
+                break
+    if vad:
+        log(f"ep{episode_id} {voice_gate.summary(vad)}")
+
     with store.connect() as conn:
         conn.execute(
             "UPDATE episodes SET capture_id=?, decode_status='captured', features_json=? WHERE id=?",
@@ -149,6 +162,12 @@ def record_bundle(episode: dict[str, Any], bundle: dict[str, Any], capture_id: s
         conn.commit()
 
     intel = classify_signal(int(episode["freq_hz"]), {"features": bundle.get("features") or {}})
+    if vad:
+        intel = dict(intel)
+        intel["vad"] = vad
+        if vad.get("gate_pass"):
+            intel["likely"] = "Voice (demodulated audio)"
+            intel["confidence"] = "high"
     store.set_intel(episode_id, intel)
 
     pre_hits = bundle.get("decode") if isinstance(bundle.get("decode"), list) else None
