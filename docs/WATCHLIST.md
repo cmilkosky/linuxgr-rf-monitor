@@ -3,6 +3,10 @@
 The tier that turns discovery into coverage. Without it the third tier never
 fills up and every frequency worth watching is a manual edit somewhere.
 
+> Serving lane: [`rf-scanner`](WATCHLIST-SCANNER.md) (design A). Adding a
+> frequency on `/watchlist` is enough - the scanner regroups its chunks from the
+> list each pass, so no config edit or restart is needed.
+
 ## The loop
 
 ```

@@ -1,0 +1,26 @@
+[Unit]
+Description=RF Monitor watchlist wideband scanner (one capture, every watchlist channel)
+Documentation=https://github.com/cmilkosky/linuxgr-rf-monitor
+After=network.target rf-adsb-readsb.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=cmilkosk
+Group=cmilkosk
+WorkingDirectory=/home/cmilkosk/rf-monitor
+# Runs as cmilkosk for the same reason readsb does: the RTL device nodes are
+# root:plugdev and cmilkosk is in plugdev, and the episodes/artifacts are its files.
+EnvironmentFile=-/home/cmilkosk/.config/rf-scanner.env
+# RF_SCANNER_DEVICE is a libusb INDEX (rtl_sdr has no serial flag): 2 = SN RTL2 on
+# the D3000N feed, the dongle the hopper used to hold. Re-read `rtl_test -t` after
+# any USB change. Never 1 (RTL0 = ADS-B) or 0 (RTL3 = LAN sharing).
+ExecStart=/usr/bin/python3 /home/cmilkosk/rf-monitor/rf_scanner.py --loop
+Restart=always
+RestartSec=10
+# Below the decoders on purpose: a late scan pass is cheap, a starved ADS-B or
+# wideband decode is not.
+Nice=5
+
+[Install]
+WantedBy=multi-user.target
