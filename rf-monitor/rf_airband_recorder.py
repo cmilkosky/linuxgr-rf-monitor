@@ -35,7 +35,6 @@ import numpy as np
 
 import rf_decode
 import rf_v2_capture as cap
-import rf_voice_gate as voice_gate
 import signals_store as store
 
 START_HZ = int(float(os.environ.get("RF_AIRBAND_START_HZ", 108_000_000)))
@@ -213,23 +212,13 @@ def _record(iq, rate, center_hz, freq_hz, audio, mod, speech, level_db) -> bool:
     info = cap.write_wav(audio, wav)
     cap._to_mp3(wav, wav.with_suffix(".mp3"))
     store.add_artifact(episode_id, "audio-am", wav, size=info["bytes"])
-    # Silero VAD decides voice presence; the envelope heuristics above only decide
-    # whether a clip is worth keeping. A VAD outage leaves the labels untouched.
-    vad = voice_gate.gate_file(wav)
-    if vad:
-        store.set_intel(episode_id, {
-            "likely": "Aviation AM voice" if vad["gate_pass"] else "AM carrier (no voice)",
-            "confidence": "high" if vad["gate_pass"] else "medium",
-            "vad": vad,
-        })
     store.mark_decoded(episode_id, "aircraft",
                        f"AM audio {audio.size / 48000:.1f}s @ {freq_hz / 1e6:.3f} MHz "
-                       f"(+{level_db:.0f} dB, mod {mod:.2f}; {voice_gate.summary(vad)})")
+                       f"(+{level_db:.0f} dB, mod {mod:.2f}) - listen to confirm voice")
     store.record_attempt(episode_id, "airband-recorder", "ok",
                          f"{audio.size / 48000:.1f}s audio mod={mod:.2f} speech={speech:.2f}")
     log(f"RECORDED ep{episode_id} {freq_hz / 1e6:.3f} MHz {audio.size / 48000:.1f}s "
-        f"mod={mod:.2f} speech={speech:.2f} {voice_gate.summary(vad)} "
-        f"-> {wav.with_suffix('.mp3').name}")
+        f"mod={mod:.2f} speech={speech:.2f} -> {wav.with_suffix('.mp3').name}")
     return True
 
 
