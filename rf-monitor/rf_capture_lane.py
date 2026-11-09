@@ -155,9 +155,21 @@ def record_bundle(episode: dict[str, Any], bundle: dict[str, Any], capture_id: s
         log(f"ep{episode_id} {voice_gate.summary(vad)}")
 
     with store.connect() as conn:
+        # freq_hz and `likely` are re-derived by the scout on every sweep, so the voice
+        # verdict is stored in its own columns: this is the only stage that listened, and
+        # its answer must survive later reclassification.
         conn.execute(
-            "UPDATE episodes SET capture_id=?, decode_status='captured', features_json=? WHERE id=?",
-            (capture_id, json.dumps(bundle.get("features")), episode_id),
+            "UPDATE episodes SET capture_id=?, decode_status='captured', features_json=?,"
+            " demod_freq_hz=?, voice_verdict=?, voice_speech_pct=?, voice_max_prob=?,"
+            " voice_checked_at=datetime('now') WHERE id=?",
+            (capture_id, json.dumps(bundle.get("features")),
+             # the capture tuned off-centre by LO_OFFSET_HZ and mixed it back out, so the
+             # audio sits at target_hz; episode.freq_hz is re-derived by the scout later.
+             int((bundle.get("capture") or {}).get("target_hz") or episode["freq_hz"]),
+             (vad or {}).get("verdict") if vad else "unchecked",
+             (vad or {}).get("speech_pct") if vad else None,
+             (vad or {}).get("max_prob") if vad else None,
+             episode_id),
         )
         conn.commit()
 
@@ -172,7 +184,37 @@ def record_bundle(episode: dict[str, Any], bundle: dict[str, Any], capture_id: s
 
     pre_hits = bundle.get("decode") if isinstance(bundle.get("decode"), list) else None
     decoded = decode.decode_episode(episode, stored, pre_hits=pre_hits)
+
+    # Voice is a filter here too, but a guarded one: drop the audio only when the clip
+    # HAS audio, the gate says no voice, AND the decode ladder found nothing. APRS,
+    # LoRa and pager frames legitimately carry no voice, so a decoded frame always
+    # survives; the spectrogram png stays either way as the evidence for the episode.
+    if vad and not vad.get("gate_pass") and decoded.get("status") != "decoded":
+        _drop_audio(episode_id, stored, voice_gate.summary(vad))
+
     return {"intel": intel, "decoded": decoded, "artifacts": len(stored)}
+
+
+def _drop_audio(episode_id: int, stored: list[dict[str, Any]], why: str) -> None:
+    """Unregister and delete the audio artifacts of a capture that is not voice."""
+    audio = [a for a in stored if str(a.get("kind", "")).startswith("audio-")]
+    if not audio:
+        return
+    with store.connect() as conn:
+        conn.execute("DELETE FROM artifacts WHERE episode_id=? AND kind LIKE 'audio-%'",
+                     (episode_id,))
+        conn.execute(
+            "UPDATE episodes SET decode_status='rejected', decoded_summary=? WHERE id=?",
+            (f"no voice and nothing decoded ({why}) - audio discarded", episode_id),
+        )
+        conn.commit()
+    for art in audio:
+        try:
+            Path(art["path"]).unlink(missing_ok=True)
+        except OSError:
+            pass
+    stored[:] = [a for a in stored if not str(a.get("kind", "")).startswith("audio-")]
+    log(f"ep{episode_id} {why} - no voice, nothing decoded: audio discarded")
 
 
 def is_blank_capture(features: dict[str, Any]) -> bool:
