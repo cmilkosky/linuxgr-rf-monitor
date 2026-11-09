@@ -21,6 +21,10 @@ import onnxruntime as ort
 SR, FRAME, CTX = 16000, 512, 64
 THRESH = float(os.environ.get("VOICE_VAD_THRESH", "0.5"))
 MIN_SPEECH_PCT = float(os.environ.get("VOICE_GATE_MIN_PCT", "1.0"))
+# Peak frame probability is the real separator, not the share of frames: on the
+# 2026-11-08 backfill a 312 MHz broadcast hit 65.5% of frames but only 0.93 peak and
+# whisper could transcribe nothing, while both genuine transmissions peaked at 1.00.
+MIN_MAX_PROB = float(os.environ.get("VOICE_GATE_MIN_MAX_PROB", "0.95"))
 MAX_BODY = int(os.environ.get("VOICE_MAX_BODY_BYTES", str(64 * 1024 * 1024)))
 MODEL = os.environ.get("SILERO_MODEL", "/opt/rf-voice-gate/silero_vad.onnx")
 
@@ -81,11 +85,15 @@ def gate(body: bytes) -> dict:
     probs = vad(audio)
     dur = len(audio) / SR
     pct = 100.0 * float((probs >= THRESH).mean())
+    peak = float(probs.max())
+    voice = pct >= MIN_SPEECH_PCT and peak >= MIN_MAX_PROB
     return {"ok": True, "duration_s": round(dur, 2),
             "speech_pct": round(pct, 1),
-            "max_prob": round(float(probs.max()), 3),
+            "max_prob": round(peak, 3),
+            "verdict": "voice" if voice else ("uncertain" if pct >= MIN_SPEECH_PCT else "none"),
             "spans": spans_of(probs, FRAME / SR),
-            "gate_pass": pct >= MIN_SPEECH_PCT,
+            "gate_pass": voice,
+            "min_pct": MIN_SPEECH_PCT, "min_max_prob": MIN_MAX_PROB,
             "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1)}
 
 
@@ -109,7 +117,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True, "model": os.path.basename(MODEL),
                          "requests": STATE["requests"], "errors": STATE["errors"],
                          "uptime_s": round(time.time() - STATE["started"], 1),
-                         "thresh": THRESH, "min_pct": MIN_SPEECH_PCT})
+                         "thresh": THRESH, "min_pct": MIN_SPEECH_PCT,
+                         "min_max_prob": MIN_MAX_PROB})
 
     def do_POST(self):
         if urlparse(self.path).path != "/gate":
