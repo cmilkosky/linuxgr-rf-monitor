@@ -18,9 +18,12 @@ scan.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import shutil
+import socket
+import struct
 import subprocess
 import tempfile
 import time
@@ -55,8 +58,42 @@ DC_SHIFT_HZ = int(float(os.environ.get("RF_SCANNER_DC_SHIFT_HZ", 300_000)))
 # Channel width by decoder. Watchlist bandwidth_hz defaults to 2 MHz (the parked-radio
 # slot width) and must NOT be used as the measurement window: averaging 2 MHz of noise
 # dilutes a 25 kHz airband carrier to nothing. Only an explicit narrow width wins.
-WIDTH_BY_DECODER = {"airband": 25_000, "voice-fm": 12_500, "aprs": 12_500,
-                    "pager": 25_000, "weather": 25_000, "ism": 12_500}
+WIDTH_BY_DECODER = {"airband": 25_000, "voice-fm": 12_500,
+                    "aprs": 12_500, "pager": 25_000, "weather": 25_000, "ism": 12_500}
+
+# --- scanner timing -------------------------------------------------------- #
+# The watchlist spans 786 MHz, so per-channel airtime is set by how fast a chunk
+# can be probed, not by how long one dwell is. The survey therefore probes each
+# chunk with PROBE_S of IQ (detection only) and only records when a channel is
+# actually above squelch: probe fast, sit on a signal, then resume. That is the
+# scanner behaviour - stop on traffic instead of spending a fixed dwell per
+# channel whether or not anything is there.
+PROBE_S = float(os.environ.get("RF_SCANNER_PROBE_S", 0.30))
+# A "hold" is how long the lane stays parked on a chunk once something breaks
+# squelch. Segments are DWELL_S long, so the recording keeps the transmission
+# while it lasts, up to HANG_MAX_S or HANG_MAX_RECORDS segments.
+HANG_MAX_S = float(os.environ.get("RF_SCANNER_HANG_MAX_S", 20.0))
+HANG_MAX_RECORDS = int(os.environ.get("RF_SCANNER_HANG_MAX_RECORDS", 3))
+# A silent channel may be a pause in a conversation; keep listening one segment
+# more before giving up (the "delay" on a hardware scanner).
+HANG_GRACE_SEG = int(os.environ.get("RF_SCANNER_HANG_GRACE_SEG", 1))
+# Don't record the same frequency twice inside one hold closer than this.
+HANG_RERECORD_S = float(os.environ.get("RF_SCANNER_HANG_RERECORD_S", 10.0))
+# After a hold, skip that frequency for a while. Without this a continuous
+# carrier (NOAA, a paging channel) parks the scanner on itself every pass and
+# the rest of the watchlist starves.
+HANG_REVISIT_S = float(os.environ.get("RF_SCANNER_HANG_REVISIT_S", 300.0))
+# Total time one pass may spend holding, so a busy band cannot freeze the survey.
+PASS_HOLD_S = float(os.environ.get("RF_SCANNER_PASS_HOLD_S", 45.0))
+# If a channel breaks squelch but produces nothing to record (a burst that ended,
+# a data carrier, a spur), re-holding it every pass just burns the pass budget.
+# Skip it for this long instead of the full revisit window.
+HANG_MISS_SKIP_S = float(os.environ.get("RF_SCANNER_HANG_MISS_SKIP_S", 60.0))
+# rtl_tcp holds the dongle and is retuned per chunk; the R820T needs a moment to
+# settle after a retune, and those samples are discarded rather than detected on.
+SETTLE_S = float(os.environ.get("RF_SCANNER_SETTLE_S", 0.05))
+TCP_PORT = int(os.environ.get("RF_SCANNER_TCP_PORT", 12345))
+USE_TCP = os.environ.get("RF_SCANNER_USE_TCP", "1") not in ("0", "false", "no")
 
 ASR_URL = os.environ.get("RF_SCANNER_ASR_URL",
                          "http://192.168.202.59:10401/v1/audio/transcriptions")
@@ -145,6 +182,172 @@ def read_rtl_iq(path: Path) -> np.ndarray:
     iq = ((raw[0::2].astype(np.float32) - 127.5)
           + 1j * (raw[1::2].astype(np.float32) - 127.5))
     return (iq / 128.0).astype(np.complex64)
+
+
+# --------------------------------------------------------------------------- #
+# capture: one persistent rtl_tcp stream, retuned per chunk
+# --------------------------------------------------------------------------- #
+class RtlStream:
+    """A persistent rtl_tcp connection so a retune costs milliseconds.
+
+    One `rtl_sdr` process per chunk cost ~1.5 s of spawn/teardown plus a 24 MB
+    write and read-back through /tmp, so a 5 s dwell took ~7 s of wall time and a
+    survey pass could not be short. rtl_tcp streams continuously and takes a
+    set-frequency command over the same socket, so probing a chunk costs roughly
+    settle + probe instead of a process launch: the whole watchlist gets sampled
+    every few seconds rather than every 70.
+    """
+
+    CMD_SET_FREQ = 0x01
+
+    def __init__(self, device: str = DEVICE, rate: int = RATE,
+                 gain: str = GAIN, port: int = TCP_PORT):
+        self.device, self.rate, self.gain, self.port = device, rate, gain, port
+        self.proc: subprocess.Popen | None = None
+        self.sock: socket.socket | None = None
+        self.centre = 0
+
+    def start(self) -> None:
+        cmd = ["rtl_tcp", "-a", "127.0.0.1", "-p", str(self.port),
+               "-d", str(self.device), "-f", "100000000", "-s", str(self.rate)]
+        if self.gain and str(self.gain) != "auto":
+            cmd += ["-g", str(self.gain)]
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.PIPE)
+        deadline = time.time() + 15.0
+        while True:
+            try:
+                sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+                break
+            except OSError:
+                if self.proc.poll() is not None or time.time() > deadline:
+                    err = (self.proc.stderr.read() or b"")[-300:]
+                    raise RuntimeError("rtl_tcp did not start: "
+                                       + err.decode("utf-8", "replace").strip())
+                time.sleep(0.2)
+        sock.settimeout(10)
+        self.sock = sock
+        # rtl_tcp opens with a 12-byte header ("RTL0", tuner type, gain count).
+        header = self._read_exact(12)
+        if header[:4] != b"RTL0":
+            raise RuntimeError(f"unexpected rtl_tcp header {header[:4]!r}")
+
+    def stop(self) -> None:
+        try:
+            if self.sock is not None:
+                self.sock.close()
+        except OSError:
+            pass
+        try:
+            if self.proc is not None and self.proc.poll() is None:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+        except OSError:
+            pass
+        self.sock = None
+        self.proc = None
+        self.centre = 0
+
+    def _read_exact(self, nbytes: int) -> bytes:
+        assert self.sock is not None, "rtl_tcp stream is not started"
+        buf = bytearray()
+        while len(buf) < nbytes:
+            chunk = self.sock.recv(min(1 << 20, nbytes - len(buf)))
+            if not chunk:
+                raise RuntimeError("rtl_tcp socket closed")
+            buf += chunk
+        return bytes(buf)
+
+    def _drain(self) -> None:
+        """Drop whatever queued while we were demodulating a previous segment."""
+        assert self.sock is not None, "rtl_tcp stream is not started"
+        self.sock.setblocking(False)
+        try:
+            while True:
+                try:
+                    if not self.sock.recv(1 << 20):
+                        break
+                except (BlockingIOError, socket.timeout):
+                    break
+        finally:
+            self.sock.setblocking(True)
+            self.sock.settimeout(10)
+
+    def retune(self, centre_hz: int) -> None:
+        assert self.sock is not None, "rtl_tcp stream is not started"
+        self.sock.sendall(struct.pack(">BI", self.CMD_SET_FREQ,
+                                      int(centre_hz) & 0xFFFFFFFF))
+        self.centre = int(centre_hz)
+        time.sleep(SETTLE_S)   # let the PLL settle...
+        self._drain()          # ...then drop those samples rather than detect on them
+
+    def grab(self, centre_hz: int, seconds: float) -> np.ndarray:
+        assert self.sock is not None, "rtl_tcp stream is not started"
+        centre_hz = int(centre_hz)
+        if centre_hz != self.centre:
+            self.retune(centre_hz)
+        else:
+            self._drain()
+        n = int(self.rate * seconds)
+        self.sock.settimeout(max(10.0, seconds + 10.0))
+        raw = np.frombuffer(self._read_exact(2 * n), dtype=np.uint8)
+        iq = ((raw[0::2].astype(np.float32) - 127.5)
+              + 1j * (raw[1::2].astype(np.float32) - 127.5))
+        return (iq / 128.0).astype(np.complex64)
+
+
+_stream: RtlStream | None = None
+_tcp_dead = False
+
+
+def stop_stream() -> None:
+    global _stream
+    if _stream is not None:
+        _stream.stop()
+        _stream = None
+
+
+atexit.register(stop_stream)
+
+
+def grab(centre_hz: int, seconds: float) -> np.ndarray:
+    """One capture of a chunk: shared stream when possible, temp file as fallback."""
+    global _stream, _tcp_dead
+    if USE_TCP and not _tcp_dead:
+        if _stream is None:
+            try:
+                _stream = RtlStream()
+                _stream.start()
+                log(f"stream: rtl_tcp 127.0.0.1:{TCP_PORT} device {DEVICE} "
+                    f"{RATE / 1e6:.1f} MS/s")
+            except Exception as exc:
+                log(f"rtl_tcp unavailable ({exc}); using one rtl_sdr process per chunk")
+                _tcp_dead = True
+                _stream = None
+        if _stream is not None:
+            try:
+                return _stream.grab(centre_hz, seconds)
+            except Exception as exc:
+                log(f"stream read failed ({exc}); restarting the stream")
+                stop_stream()
+                try:
+                    _stream = RtlStream()
+                    _stream.start()
+                    return _stream.grab(centre_hz, seconds)
+                except Exception as exc2:
+                    log(f"stream restart failed ({exc2}); using rtl_sdr per chunk")
+                    _stream = None
+                    _tcp_dead = True
+    tmp = Path(tempfile.mkdtemp(prefix="rfscan-"))
+    path = tmp / "chunk.iq"
+    try:
+        capture(centre_hz, seconds, path)
+        return read_rtl_iq(path)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -396,75 +599,155 @@ def record(entry: dict, freq_hz: int, level: dict, audio: np.ndarray, mode: str,
 
 
 # --------------------------------------------------------------------------- #
-# cycle
+# one channel: demod both modes, gate, decode, transcribe, record
 # --------------------------------------------------------------------------- #
-def cycle(chunks: list[dict] | None = None, *, dwell: float | None = None) -> dict:
+_hang_last: dict[int, float] = {}
+
+
+def process_channel(iq: np.ndarray, chunk: dict, freq: int, lv: dict,
+                    stats: dict) -> int | None:
+    entry = lv["entry"]
+    order = ["am", "nfm"] if (entry.get("decoder") or "") == "airband" else ["nfm", "am"]
+    best = None
+    tmp = Path(tempfile.mkdtemp(prefix="rfscan-g-"))
+    try:
+        for mode in order:
+            try:
+                audio = demod_channel(iq, RATE, chunk["centre_hz"], freq, mode)
+            except Exception as exc:
+                log(f"   {freq / 1e6:.3f} MHz {mode} demod failed: {exc}")
+                continue
+            if audio.size < 4_800:
+                continue
+            gpath = wav16(audio, 48_000, tmp / f"g-{mode}.wav")
+            vad = voice_gate.gate_file(gpath)
+            score = float((vad or {}).get("speech_pct") or 0.0)
+            if best is None or score > best[2]:
+                best = (mode, audio, score, vad, gpath)
+            if score >= 1.0:
+                break
+        if best is None:
+            return None
+        mode, audio, speech_pct, vad, gpath = best
+        if not (speech_pct >= 1.0 or KEEP_SILENT):
+            log(f"   {freq / 1e6:.3f} MHz +{lv['snr_db']:.1f} dB no voice, skipped")
+            return None
+        try:
+            hits = rf_decode.run_multimon(rf_decode.audio_to_raw_22050(gpath), freq)
+        except Exception as exc:
+            log(f"   {freq / 1e6:.3f} MHz multimon failed: {exc}")
+            hits = []
+        asr = transcribe(gpath) if (speech_pct >= 1.0 or hits) else None
+        ep = record(entry, freq, lv, audio, mode, vad, asr, hits,
+                    iq=iq, centre_hz=chunk["centre_hz"])
+        stats["active"] += 1
+        stats["recorded"] += 1
+        if (asr or {}).get("text"):
+            stats["voice"] += 1
+        if hits:
+            stats["data"] += 1
+        return ep
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
+# hold: stay on the chunk while something keeps breaking squelch
+# --------------------------------------------------------------------------- #
+def _skip_for(freq: int, seconds: float) -> None:
+    """Make the next hold on this frequency wait `seconds` (same clock as revisit)."""
+    _hang_last[freq] = time.time() - (HANG_REVISIT_S - seconds)
+
+
+def hold(chunk: dict, stats: dict, dwell: float, budget_s: float) -> float:
+    """Park on this chunk and keep recording while it stays active.
+
+    This is the scanner part: after a fast probe finds traffic, sit on it so the
+    whole transmission is captured instead of the 0.3 s probe. Returns seconds
+    spent so the pass can stay inside its hold budget.
+    """
+    t0 = time.time()
+    quiet = 0
+    records = 0
+    segments = 0
+    last_record: dict[int, float] = {}
+    iq = grab(chunk["centre_hz"], dwell)
+    while True:
+        segments += 1
+        levels = channel_snr(iq, chunk["centre_hz"], chunk["entries"])
+        active = {f: lv for f, lv in levels.items() if lv["snr_db"] >= SQUELCH_DB}
+        for freq, lv in sorted(active.items(), key=lambda kv: -kv[1]["snr_db"]):
+            if records >= HANG_MAX_RECORDS:
+                break
+            last = last_record.get(freq, 0.0)
+            if last and time.time() - last < HANG_RERECORD_S:
+                continue
+            if process_channel(iq, chunk, freq, lv, stats):
+                last_record[freq] = time.time()
+                _last[freq] = time.time()
+                _hang_last[freq] = time.time()
+                records += 1
+            else:
+                _skip_for(freq, HANG_MISS_SKIP_S)
+        if not active:
+            quiet += 1
+            if quiet > HANG_GRACE_SEG:
+                break
+        else:
+            quiet = 0
+        # A short burst can trip the probe and be gone by the time the hold
+        # starts. Two segments with nothing recorded means there is nothing to
+        # sit on - go back to scanning instead of burning the pass budget.
+        if records == 0 and segments >= 2:
+            break
+        elapsed = time.time() - t0
+        if elapsed + dwell > min(HANG_MAX_S, budget_s):
+            break
+        iq = grab(chunk["centre_hz"], dwell)
+    spent = time.time() - t0
+    log(f"   hold {chunk['centre_hz'] / 1e6:.3f} MHz {spent:.1f}s, "
+        f"{records} record(s) in {segments} segment(s)")
+    return spent
+
+
+# --------------------------------------------------------------------------- #
+# cycle: one survey pass
+# --------------------------------------------------------------------------- #
+def cycle(chunks: list[dict] | None = None, *, probe: float | None = None,
+          dwell: float | None = None) -> dict:
+    """Probe every chunk fast, hold wherever a channel breaks squelch."""
+    probe = PROBE_S if probe is None else probe
     dwell = DWELL_S if dwell is None else dwell
-    stats = {"chunks": 0, "active": 0, "recorded": 0, "voice": 0, "data": 0}
+    stats = {"chunks": 0, "probed": 0, "hot": 0, "holds": 0, "active": 0,
+             "recorded": 0, "voice": 0, "data": 0, "held_s": 0.0, "seconds": 0.0}
+    t0 = time.time()
+    budget = PASS_HOLD_S
     for chunk in chunks or plan():
         stats["chunks"] += 1
-        tmp = Path(tempfile.mkdtemp(prefix="rfscan-"))
-        path = tmp / "chunk.iq"
         try:
-            size = capture(chunk["centre_hz"], dwell, path)
-            iq = read_rtl_iq(path)
+            t_chunk = time.time()
+            iq = grab(chunk["centre_hz"], probe)
+            stats["probed"] += 1
             levels = channel_snr(iq, chunk["centre_hz"], chunk["entries"])
             active = {f: lv for f, lv in levels.items() if lv["snr_db"] >= SQUELCH_DB}
-            log(f"chunk {chunk['centre_hz'] / 1e6:.3f} MHz {size / 1e6:.1f} MB "
-                f"{len(chunk['entries'])} watchlist ch, {len(active)} over {SQUELCH_DB:.0f} dB")
-            done = 0
-            for freq, lv in sorted(active.items(), key=lambda kv: -kv[1]["snr_db"]):
-                if time.time() - _last.get(freq, 0.0) < COOLDOWN_S:
-                    continue
-                entry = lv["entry"]
-                offset = float(freq - chunk["centre_hz"])
-                hint = (entry.get("decoder") or "")
-                order = ["am", "nfm"] if hint == "airband" else ["nfm", "am"]
-                best = None
-                for mode in order:
-                    try:
-                        audio = demod_channel(iq, RATE, chunk["centre_hz"], freq, mode)
-                    except Exception as exc:
-                        log(f"   {freq / 1e6:.3f} MHz {mode} demod failed: {exc}")
-                        continue
-                    if audio.size < 4_800:
-                        continue
-                    gpath = wav16(audio, 48_000, tmp / f"g-{mode}.wav")
-                    vad = voice_gate.gate_file(gpath)
-                    score = float((vad or {}).get("speech_pct") or 0.0)
-                    if best is None or score > best[2]:
-                        best = (mode, audio, score, vad, gpath)
-                    if score >= 1.0:
-                        break
-                if best is None:
-                    continue
-                mode, audio, speech_pct, vad, gpath = best
-                if not (speech_pct >= 1.0 or KEEP_SILENT):
-                    log(f"   {freq / 1e6:.3f} MHz +{lv['snr_db']:.1f} dB no voice, skipped")
-                    _last[freq] = time.time()
-                    continue
-                try:
-                    hits = rf_decode.run_multimon(rf_decode.audio_to_raw_22050(gpath), freq)
-                except Exception as exc:
-                    log(f"   {freq / 1e6:.3f} MHz multimon failed: {exc}")
-                    hits = []
-                asr = transcribe(gpath) if (speech_pct >= 1.0 or hits) else None
-                ep = record(entry, freq, lv, audio, mode, vad, asr, hits,
-                            iq=iq, centre_hz=chunk["centre_hz"])
-                stats["active"] += 1
-                stats["recorded"] += 1
-                if (asr or {}).get("text"):
-                    stats["voice"] += 1
-                if hits:
-                    stats["data"] += 1
-                _last[freq] = time.time()
-                done += 1
-                if done >= MAX_PER_CHUNK:
-                    break
-        except Exception as exc:  # never die on one bad chunk
+            stats["hot"] += len(active)
+            detail = " ".join(f"{f / 1e6:.3f}({lv['snr_db']:+.0f})"
+                              for f, lv in sorted(active.items()))
+            log(f"probe {chunk['centre_hz'] / 1e6:.3f} MHz {probe:.2f}s "
+                f"{len(chunk['entries'])} ch, {len(active)} over {SQUELCH_DB:.0f} dB "
+                f"[{time.time() - t_chunk:.2f}s]"
+                + (f" -> {detail}" if detail else ""))
+            now = time.time()
+            holdable = {f: lv for f, lv in active.items()
+                        if now - _hang_last.get(f, 0.0) >= HANG_REVISIT_S}
+            if holdable and budget > 0:
+                stats["holds"] += 1
+                spent = hold(chunk, stats, dwell, budget)
+                budget -= spent
+                stats["held_s"] = round(stats["held_s"] + spent, 1)
+        except Exception as exc:          # never die on one bad chunk
             log(f"chunk {chunk['centre_hz'] / 1e6:.3f} MHz failed: {exc}")
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+    stats["seconds"] = round(time.time() - t0, 1)
     return stats
 
 
@@ -473,7 +756,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--plan", action="store_true")
-    parser.add_argument("--dwell", type=float, default=None)
+    parser.add_argument("--probe", type=float, default=None,
+                        help="survey window per chunk, seconds")
+    parser.add_argument("--dwell", type=float, default=None,
+                        help="hold segment length, seconds")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
@@ -485,14 +771,22 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.loop:
-        log(f"watchlist scanner: device={DEVICE} rate={RATE} dwell={DWELL_S:.0f}s "
-            f"squelch=+{SQUELCH_DB:.0f} dB asr={'on' if ASR_ENABLE else 'off'}")
-        while True:
-            stats = cycle(dwell=args.dwell)
-            log(f"cycle done: {stats}")
-            time.sleep(2.0)
+        log(f"watchlist scanner: device={DEVICE} {RATE / 1e6:.1f} MS/s "
+            f"probe={PROBE_S:.2f}s hold<={HANG_MAX_S:.0f}s/{HANG_MAX_RECORDS} rec "
+            f"revisit={HANG_REVISIT_S:.0f}s squelch=+{SQUELCH_DB:.0f} dB "
+            f"capture={'rtl_tcp' if USE_TCP else 'rtl_sdr'} "
+            f"asr={'on' if ASR_ENABLE else 'off'}")
+        try:
+            while True:
+                stats = cycle(probe=args.probe, dwell=args.dwell)
+                log(f"cycle done in {stats['seconds']}s: {stats}")
+        finally:
+            stop_stream()
 
-    stats = cycle(dwell=args.dwell)
+    try:
+        stats = cycle(probe=args.probe, dwell=args.dwell)
+    finally:
+        stop_stream()
     print(json.dumps(stats, indent=2) if args.json else f"cycle: {stats}")
     return 0
 
