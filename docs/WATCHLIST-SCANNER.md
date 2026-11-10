@@ -17,25 +17,44 @@ want the same libusb index.
    centre each chunk and **nudge the LO 300 kHz** when a watched channel would sit
    within 150 kHz of centre, because the R820T DC spike reads ~+58 dB and would
    otherwise be mistaken for a carrier (or bury a real one).
-3. Capture `RF_SCANNER_DWELL_S` seconds, one `rtl_sdr` process per chunk.
+3. **Probe** each chunk for `RF_SCANNER_PROBE_S` (0.30 s) on a persistent
+   `rtl_tcp` stream that is retuned over the socket. A probe costs **0.38 s**, so
+   all 9 chunks are surveyed in **3.4-3.7 s** - the whole watchlist is sampled
+   every few seconds instead of once a minute. (`rtl_sdr` per chunk is kept as a
+   fallback if `rtl_tcp` cannot start.)
 4. Per channel: peak bin inside the channel width, compared to **p99.5 of the
    band** - the matched statistic (see below).
-5. Anything ≥ `RF_SCANNER_SQUELCH_DB` is demodulated twice, AM and NFM, and the
-   first mode that gates as voice (or decodes) wins.
-6. Silero VAD on the demodulated audio; if speech ≥1% or a data protocol decoded,
+5. A channel over `RF_SCANNER_SQUELCH_DB` makes the lane **hold**: it keeps
+   taking `RF_SCANNER_DWELL_S` segments and recording while the channel stays
+   active (up to `HANG_MAX_S`, `HANG_MAX_RECORDS`), then resumes the survey.
+   That is the scanner behaviour - the 0.3 s probe decides, the hold captures.
+   A hold that records nothing after two segments gives up, the frequency is
+   skipped for `HANG_REVISIT_S` after a hold (so NOAA or a paging channel cannot
+   park the scanner on itself), and `PASS_HOLD_S` caps total hold time in a pass.
+6. Anything held is demodulated twice, AM and NFM, and the first mode that gates
+   as voice (or decodes) wins.
+7. Silero VAD on the demodulated audio; if speech ≥1% or a data protocol decoded,
    whisper large-v3 through the Frigate ASR gateway on linux5 writes a transcript.
-7. `multimon-ng` runs on every candidate for data (APRS, POCSER/FLEX, EAS, ACARS,
+8. `multimon-ng` runs on every candidate for data (APRS, POCSER/FLEX, EAS, ACARS,
    AIS, FT8).
-8. Record an episode for **everything above squelch** - voice, data, or an
+9. Record an episode for **everything above squelch** - voice, data, or an
    unidentified carrier (`RF_SCANNER_KEEP_SILENT=1`). Nothing is silently dropped.
 
-Measured 2026-11-09 (EST evening), 9 chunks, ~75 s per pass at 5 s dwell:
+Measured 2026-11-10 00:33 UTC / 2026-11-09 19:33 EST, 9 chunks, 0.30 s probe:
+
+| | Before (5 s dwell, rtl_sdr per chunk) | Now (0.30 s probe + hold) |
+|---|---|---|
+| whole-watchlist pass | ~70 s | **3.4-3.7 s** quiet, 22-36 s when it holds |
+| per chunk | ~7 s | 0.38 s |
+| a channel is looked at | once per ~70 s | once per ~3.5 s |
 
 | Frequency | Result |
 |---|---|
 | 123.800 KTTN/PHL approach | AM voice 40.4% -> "Down to 25 miles per hour, 741 has the airfield in sight." |
-| 162.550 NOAA WX | NFM voice 72-78% -> full marine forecast transcripts |
-| 144.390 APRS | recorded as carrier; packets did not decode in the 8 s window |
+| 162.550 NOAA WX | NFM voice 60-95% -> marine forecast transcripts on every hold |
+| 154.430 Mercer fire/EMS | caught at +9 dB on a fast pass the previous cycle had seen as quiet |
+| 144.390 APRS | recorded as carrier; packets did not decode in the segment |
+| 930.000 paging | caught on probe (+19 to +27 dB), nothing to record - skipped 60 s |
 
 ## Two bugs this lane had to fix
 
@@ -66,12 +85,21 @@ copies. Verified: `/api/episodes/43081/{meta,audio/nfm,spectrum}` all 200.
 
 | Var | Default | Meaning |
 |---|---|---|
-| `RF_SCANNER_DWELL_S` | 5 | capture length per chunk; pass time ≈ chunks × (dwell + 3 s) |
+| `RF_SCANNER_PROBE_S` | 0.30 | survey window per chunk (detection only). 0.30 s → ~3.5 s per pass |
+| `RF_SCANNER_DWELL_S` | 5 | hold segment length - what a recording actually covers |
+| `RF_SCANNER_HANG_MAX_S` | 20 | max seconds parked on one chunk after a hit |
+| `RF_SCANNER_HANG_MAX_RECORDS` | 3 | max recordings in one hold |
+| `RF_SCANNER_HANG_REVISIT_S` | 300 | after a hold, leave that frequency alone this long |
+| `RF_SCANNER_HANG_MISS_SKIP_S` | 60 | a hit that records nothing is skipped this long |
+| `RF_SCANNER_PASS_HOLD_S` | 45 | total hold time allowed in one pass |
+| `RF_SCANNER_SETTLE_S` | 0.05 | discarded after a retune (PLL settling) |
+| `RF_SCANNER_TCP_PORT` | 12345 | loopback port for the persistent rtl_tcp stream |
 | `RF_SCANNER_SQUELCH_DB` | 8 | dB over band p99.5 to demodulate |
-| `RF_SCANNER_COOLDOWN_S` | 90 | don't re-record the same frequency inside this window |
-| `RF_SCANNER_MAX_PER_CHUNK` | 3 | cap demod work per chunk |
 | `RF_SCANNER_GAIN` | auto | set a dB value for steadier levels on a hot feed |
 | `RF_SCANNER_ASR_ENABLE` | 1 | whisper transcription on voice/data |
+
+Survey time is `chunks × (PROBE_S + SETTLE_S + drain)`; lowering `PROBE_S` below
+~0.2 s starts costing detection (only ~14 FFT frames left to judge a channel).
 
 ## Hardware gotcha
 
