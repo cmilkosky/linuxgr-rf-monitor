@@ -21,6 +21,7 @@ import argparse
 import atexit
 import json
 import os
+import re
 import shutil
 import socket
 import struct
@@ -40,7 +41,22 @@ import rf_voice_gate as voice_gate
 import rf_watchlist
 import signals_store as store
 
-DEVICE = os.environ.get("RF_SCANNER_DEVICE", "2")
+# --- dongle selection ------------------------------------------------------ #
+# Open the radio by SERIAL, not by libusb index. The index map on this host has
+# flipped at least twice (USB replug / re-enumeration), and rtl_tcp and rtl_sdr
+# have no --serial flag, so a numeric index is a promise that the next replug can
+# hand this lane the ADS-B dongle (RTL0) and collide with readsb. Mirrors
+# resolve_rtl_index() in /usr/local/sbin/sdr-share.
+#   RF_SCANNER_DEVICE_SERIAL  serial this lane pins (default RTL2 = watchlist dongle).
+#                             Empty it to pin by index instead.
+#   RF_SCANNER_DEVICE         legacy index, used as the fallback when the serial is
+#                             not in the map; a serial here ("RTL2") also pins.
+DEVICE_SERIAL = os.environ.get("RF_SCANNER_DEVICE_SERIAL", "RTL2").strip()
+DEVICE_OVERRIDE = os.environ.get("RF_SCANNER_DEVICE", "").strip()
+# Last known-good index, used only when the serial cannot be resolved.
+FALLBACK_INDEX = DEVICE_OVERRIDE if DEVICE_OVERRIDE.isdigit() else "2"
+DEVICE = FALLBACK_INDEX          # effective index; resolve_device_index() sets this
+_PINNED_SERIAL = ""              # serial the current DEVICE was resolved from
 RATE = int(float(os.environ.get("RF_SCANNER_RATE", 2_400_000)))
 DWELL_S = float(os.environ.get("RF_SCANNER_DWELL_S", 5.0))
 GAIN = os.environ.get("RF_SCANNER_GAIN", "auto")
@@ -103,6 +119,11 @@ ASR_TIMEOUT = float(os.environ.get("RF_SCANNER_ASR_TIMEOUT", 120))
 # /etc/frigate-audio-asr-gateway.env on linux5); without a bearer it answers 401 and
 # every transcript silently disappears. Keep the key in the service EnvironmentFile.
 ASR_KEY = os.environ.get("RF_SCANNER_ASR_KEY", "").strip()
+# NOAA WX (162.400-162.550 MHz) is wall-to-wall speech: transcribing it floods the
+# whisper lane with repeating bulletins and buys nothing. Audio is still recorded
+# and data hits are still decoded - only the ASR call is skipped inside these
+# bands. Comma-separated "lo-hi" ranges in Hz; empty string disables the guard.
+ASR_SKIP_HZ = os.environ.get("RF_SCANNER_ASR_SKIP_HZ", "162.400e6-162.550e6")
 KEEP_SILENT = os.environ.get("RF_SCANNER_KEEP_SILENT", "1") not in ("0", "false", "no")
 FRAME = 32768
 _last: dict[int, float] = {}
@@ -110,6 +131,65 @@ _last: dict[int, float] = {}
 
 def log(msg: str) -> None:
     print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), msg, flush=True)
+
+
+def pin_serial() -> str:
+    """The serial this lane should hold ('' = pin by index instead)."""
+    if DEVICE_OVERRIDE and not DEVICE_OVERRIDE.isdigit():
+        return DEVICE_OVERRIDE          # RF_SCANNER_DEVICE=RTL2 pins that serial
+    return DEVICE_SERIAL
+
+
+def enumerate_rtl_devices() -> list[tuple[str, str]]:
+    """[(libusb index, serial)] from `rtl_test -t`, whose map is printed on stderr."""
+    try:
+        proc = subprocess.run(["rtl_test", "-t"], capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"device: rtl_test failed ({exc}); cannot read the dongle map")
+        return []
+    text = (proc.stdout + proc.stderr).decode("utf-8", "replace")
+    found: list[tuple[str, str]] = []
+    for line in text.splitlines():
+        match = re.match(r"\s*(\d+):.*?\bSN:\s*(\S+)", line)
+        if match:
+            found.append((match.group(1), match.group(2)))
+    return found
+
+
+def resolve_device_index(serial: str = "") -> str:
+    """Translate the pinned serial into the index rtl_tcp/rtl_sdr must be given.
+
+    Called at startup and again on every stream restart: a replug renumbers the
+    bus, so the number is only good until the next enumeration. If the serial is
+    not in the map (unplugged, unreadable EEPROM, no USB permission) this falls
+    back to the configured index and logs the whole map, because a scanner that
+    refuses to start over a dongle map protects nothing.
+    """
+    global DEVICE, _PINNED_SERIAL
+    want = (serial or pin_serial()).strip()
+    if not want:
+        DEVICE, _PINNED_SERIAL = FALLBACK_INDEX, ""
+        log(f"device: index {DEVICE} (no serial pinned, explicit RF_SCANNER_DEVICE)")
+        return DEVICE
+    devices = enumerate_rtl_devices()
+    for index, found in devices:
+        if found == want:
+            DEVICE, _PINNED_SERIAL = index, found
+            log(f"device: serial {want} -> index {index}")
+            return DEVICE
+    DEVICE, _PINNED_SERIAL = FALLBACK_INDEX, ""
+    log(f"device: serial {want!r} not in the map; falling back to index {DEVICE}")
+    if devices:
+        for index, found in devices:
+            log(f"   {index}: SN {found}")
+    else:
+        log("   (no dongle enumerated at all)")
+    return DEVICE
+
+
+def device_label() -> str:
+    """' (SN RTL2)' when this index came from a serial, '' when it was given."""
+    return f" (SN {_PINNED_SERIAL})" if _PINNED_SERIAL else ""
 
 
 # --------------------------------------------------------------------------- #
@@ -200,9 +280,10 @@ class RtlStream:
 
     CMD_SET_FREQ = 0x01
 
-    def __init__(self, device: str = DEVICE, rate: int = RATE,
+    def __init__(self, device: str | None = None, rate: int = RATE,
                  gain: str = GAIN, port: int = TCP_PORT):
-        self.device, self.rate, self.gain, self.port = device, rate, gain, port
+        # None = whatever resolve_device_index() last decided (serial -> index).
+        self.device, self.rate, self.gain, self.port = device or DEVICE, rate, gain, port
         self.proc: subprocess.Popen | None = None
         self.sock: socket.socket | None = None
         self.centre = 0
@@ -321,7 +402,7 @@ def grab(centre_hz: int, seconds: float) -> np.ndarray:
             try:
                 _stream = RtlStream()
                 _stream.start()
-                log(f"stream: rtl_tcp 127.0.0.1:{TCP_PORT} device {DEVICE} "
+                log(f"stream: rtl_tcp 127.0.0.1:{TCP_PORT} device {DEVICE}{device_label()} "
                     f"{RATE / 1e6:.1f} MS/s")
             except Exception as exc:
                 log(f"rtl_tcp unavailable ({exc}); using one rtl_sdr process per chunk")
@@ -334,6 +415,9 @@ def grab(centre_hz: int, seconds: float) -> np.ndarray:
                 log(f"stream read failed ({exc}); restarting the stream")
                 stop_stream()
                 try:
+                    # A replug renumbers the bus: re-read the serial->index map
+                    # before opening the radio again, or we reopen the wrong dongle.
+                    resolve_device_index()
                     _stream = RtlStream()
                     _stream.start()
                     return _stream.grab(centre_hz, seconds)
@@ -473,6 +557,28 @@ def wav16(audio: np.ndarray, rate: int, path: Path) -> Path:
         w.setframerate(16_000)
         w.writeframes(pcm.tobytes())
     return path
+
+
+def _parse_bands(spec: str) -> list[tuple[int, int]]:
+    bands: list[tuple[int, int]] = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        lo, _, hi = part.partition("-")
+        try:
+            bands.append((int(float(lo)), int(float(hi or lo))))
+        except ValueError:
+            continue
+    return bands
+
+
+ASR_SKIP_BANDS = _parse_bands(ASR_SKIP_HZ)
+
+
+def asr_skipped(freq_hz: int) -> bool:
+    """True when this frequency sits in a band we record but do not transcribe."""
+    return any(lo <= int(freq_hz) <= hi for lo, hi in ASR_SKIP_BANDS)
 
 
 def transcribe(wav_path: Path) -> dict | None:
@@ -637,7 +743,11 @@ def process_channel(iq: np.ndarray, chunk: dict, freq: int, lv: dict,
         except Exception as exc:
             log(f"   {freq / 1e6:.3f} MHz multimon failed: {exc}")
             hits = []
-        asr = transcribe(gpath) if (speech_pct >= 1.0 or hits) else None
+        if asr_skipped(freq):
+            log(f"   {freq / 1e6:.3f} MHz ASR skipped (excluded band, audio kept)")
+            asr = None
+        else:
+            asr = transcribe(gpath) if (speech_pct >= 1.0 or hits) else None
         ep = record(entry, freq, lv, audio, mode, vad, asr, hits,
                     iq=iq, centre_hz=chunk["centre_hz"])
         stats["active"] += 1
@@ -770,8 +880,12 @@ def main(argv: list[str] | None = None) -> int:
                   + ", ".join(f"{int(e['freq_hz']) / 1e6:.3f}" for e in chunk["entries"]))
         return 0
 
+    # Resolve the dongle by serial once before anything opens the radio (and again
+    # on every stream restart inside grab()).
+    resolve_device_index()
+
     if args.loop:
-        log(f"watchlist scanner: device={DEVICE} {RATE / 1e6:.1f} MS/s "
+        log(f"watchlist scanner: device={DEVICE}{device_label()} {RATE / 1e6:.1f} MS/s "
             f"probe={PROBE_S:.2f}s hold<={HANG_MAX_S:.0f}s/{HANG_MAX_RECORDS} rec "
             f"revisit={HANG_REVISIT_S:.0f}s squelch=+{SQUELCH_DB:.0f} dB "
             f"capture={'rtl_tcp' if USE_TCP else 'rtl_sdr'} "
