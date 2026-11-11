@@ -29,6 +29,8 @@ import signal
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -60,6 +62,24 @@ LEVEL_MIN_DB = float(os.environ.get("RF_AIRBAND_LEVEL_MIN_DB", 6.0))
 LNA = int(float(os.environ.get("RF_AIRBAND_LNA_DB", 32)))
 VGA = int(float(os.environ.get("RF_AIRBAND_VGA_DB", 24)))
 IDLE_S = float(os.environ.get("RF_AIRBAND_IDLE_S", 2.0))
+
+# --- ASR: the shared whisper lane on linux5's 5070Ti ----------------------- #
+# Airband AM voice is the one RF band that needs transcription. NOAA WX sits at
+# 162 MHz, outside this recorder's 108-137 MHz span, and is deliberately not
+# covered: it is wall-to-wall speech and would dominate the lane for no value.
+# The bearer key has exactly one home - RF_SCANNER_ASR_KEY in rf-scanner.env -
+# and this unit reads that same file as a second EnvironmentFile. Duplicating the
+# key into a second file is how the scanner lane silently 401'd for a day after
+# the 2026-11-09 rotation.
+ASR_URL = (os.environ.get("RF_AIRBAND_ASR_URL")
+           or os.environ.get("RF_SCANNER_ASR_URL")
+           or "http://192.168.202.59:10401/v1/audio/transcriptions")
+ASR_ENABLE = (os.environ.get("RF_AIRBAND_ASR_ENABLE")
+              or os.environ.get("RF_SCANNER_ASR_ENABLE") or "1") not in ("0", "false", "no")
+ASR_TIMEOUT = float(os.environ.get("RF_AIRBAND_ASR_TIMEOUT")
+                    or os.environ.get("RF_SCANNER_ASR_TIMEOUT") or 120)
+ASR_KEY = (os.environ.get("RF_AIRBAND_ASR_KEY")
+           or os.environ.get("RF_SCANNER_ASR_KEY") or "").strip()
 
 FRAME = 4096
 HOP = 1024
@@ -182,6 +202,38 @@ def _score_audio(audio: np.ndarray, rate: int = 48_000) -> dict[str, float]:
     return out
 
 
+def transcribe(audio_path: Path) -> dict | None:
+    """Send one kept clip to the homelab whisper lane and return its JSON.
+
+    The gateway (linux5:10401) is OpenAI-shaped and answers
+    {"language", "text", "speech": [...]}; it serialises against the Frigate ASR
+    worker with its own GPU admission lock, so RF work cannot collide with the
+    live speech stage.
+    """
+    if not ASR_ENABLE:
+        return None
+    boundary = "----airband%d" % int(time.time() * 1000)
+    mime = "audio/mpeg" if audio_path.suffix.lower() == ".mp3" else "audio/wav"
+    body = bytearray()
+    body += f"--{boundary}\r\n".encode()
+    body += (f'Content-Disposition: form-data; name="file"; '
+             f'filename="{audio_path.name}"\r\n').encode()
+    body += f"Content-Type: {mime}\r\n\r\n".encode()
+    body += audio_path.read_bytes()
+    body += f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(
+        ASR_URL, data=bytes(body), method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    if ASR_KEY:
+        req.add_header("Authorization", f"Bearer {ASR_KEY}")
+    try:
+        with urllib.request.urlopen(req, timeout=ASR_TIMEOUT) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        log(f"   ASR failed: {exc}")
+        return None
+
+
 def _record(iq, rate, center_hz, freq_hz, audio, mod, speech, level_db) -> bool:
     """Save WAV+MP3 for one channel and attach them to its episode."""
     blob = {
@@ -227,11 +279,23 @@ def _record(iq, rate, center_hz, freq_hz, audio, mod, speech, level_db) -> bool:
             f"{voice_gate.summary(vad)} - no voice, nothing kept")
         return False
 
-    cap._to_mp3(wav, wav.with_suffix(".mp3"))
+    mp3 = wav.with_suffix(".mp3")
+    cap._to_mp3(wav, mp3)
     store.add_artifact(episode_id, "audio-am", wav, size=info["bytes"])
+    asr = transcribe(mp3)
+    text = (asr or {}).get("text", "").strip()
+    if text:
+        txt = out_dir / f"transcript-{int(freq_hz // 1000)}kHz-{stamp}.txt"
+        txt.write_text(text + "\n", encoding="utf-8")
+        store.add_artifact(episode_id, "transcript", txt)
+    # set_intel REPLACES intel_json, so build the whole blob once instead of
+    # calling it for vad and again for the transcript.
+    intel = {"likely": "Aviation AM voice", "confidence": "high"}
     if vad:
-        store.set_intel(episode_id, {"likely": "Aviation AM voice", "confidence": "high",
-                                     "vad": vad})
+        intel["vad"] = vad
+    if text:
+        intel["transcript"] = text[:400]
+    store.set_intel(episode_id, intel)
     store.set_voice(episode_id, vad)
     with store.connect() as conn:
         conn.execute("UPDATE episodes SET demod_freq_hz=? WHERE id=?",
@@ -239,12 +303,14 @@ def _record(iq, rate, center_hz, freq_hz, audio, mod, speech, level_db) -> bool:
         conn.commit()
     store.mark_decoded(episode_id, "aircraft",
                        f"AM audio {audio.size / 48000:.1f}s @ {freq_hz / 1e6:.3f} MHz "
-                       f"(+{level_db:.0f} dB, mod {mod:.2f}; {voice_gate.summary(vad)})")
+                       f"(+{level_db:.0f} dB, mod {mod:.2f}; {voice_gate.summary(vad)})"
+                       + (f"; transcript: {text[:200]}" if text else "; transcript: none"))
     store.record_attempt(episode_id, "airband-recorder", "ok",
-                         f"{audio.size / 48000:.1f}s audio mod={mod:.2f} speech={speech:.2f}")
+                         f"{audio.size / 48000:.1f}s audio mod={mod:.2f} speech={speech:.2f}"
+                         + (f" transcript={text[:120]}" if text else " transcript=none"))
     log(f"RECORDED ep{episode_id} {freq_hz / 1e6:.3f} MHz {audio.size / 48000:.1f}s "
         f"mod={mod:.2f} speech={speech:.2f} {voice_gate.summary(vad)} "
-        f"-> {wav.with_suffix('.mp3').name}")
+        f"asr={'yes' if text else 'no'} -> {mp3.name}")
     return True
 
 
