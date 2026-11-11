@@ -40,12 +40,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import rf_voice_gate as voice_gate
 import signals_store as store
 
 LOG_PREFIX = "rf_capture_lane"
@@ -56,6 +58,12 @@ MIN_SCORE = float(os.environ.get("RF_LANE_MIN_SCORE", "60"))
 MAX_PER_RUN = int(os.environ.get("RF_LANE_MAX_PER_RUN", "1"))
 INTERVAL = float(os.environ.get("RF_LANE_INTERVAL", "60"))
 DEVICE_SERIAL = os.environ.get("RF_CAPTURE_DEVICE_SERIAL", "").strip()
+# A dwell that lands on nothing but the receiver's own noise is not a recording of
+# anything: it fills the artifact store with static and gets mislabelled as a chirp.
+# Blank captures are dropped (class='noise') instead of being kept and decoded.
+NOISE_FLATNESS = float(os.environ.get("RF_NOISE_FLATNESS", "0.80"))
+NOISE_WIDE_HZ = int(os.environ.get("RF_NOISE_WIDE_HZ", "1500000"))
+NOISE_PURGE = os.environ.get("RF_NOISE_PURGE", "1").strip().lower() not in ("0", "false", "no")
 SPUR_MASK = tuple(
     int(part) for part in os.environ.get("RF_LANE_SPUR_MASK", "89000000,101500000").split(",")
     if part.strip().isdigit()
@@ -134,19 +142,94 @@ def record_bundle(episode: dict[str, Any], bundle: dict[str, Any], capture_id: s
             store.add_artifact(episode_id, f"audio-{mode}", info["wav"], info.get("bytes") or 0)
             stored.append({"kind": f"audio-{mode}", "path": info["wav"]})
 
+    # Silero VAD verdict on the demodulated audio: the only stage of this lane that
+    # actually listens for a human voice. It labels, it does not gate - a VAD outage
+    # or disagreement must never discard a capture the radio already made.
+    vad = None
+    for art in stored:
+        if str(art.get("kind", "")).startswith("audio-"):
+            vad = voice_gate.gate_file(art["path"])
+            if vad and vad.get("gate_pass"):
+                break
+    if vad:
+        log(f"ep{episode_id} {voice_gate.summary(vad)}")
+
     with store.connect() as conn:
+        # freq_hz and `likely` are re-derived by the scout on every sweep, so the voice
+        # verdict is stored in its own columns: this is the only stage that listened, and
+        # its answer must survive later reclassification.
         conn.execute(
-            "UPDATE episodes SET capture_id=?, decode_status='captured', features_json=? WHERE id=?",
-            (capture_id, json.dumps(bundle.get("features")), episode_id),
+            "UPDATE episodes SET capture_id=?, decode_status='captured', features_json=?,"
+            " demod_freq_hz=?, voice_verdict=?, voice_speech_pct=?, voice_max_prob=?,"
+            " voice_checked_at=datetime('now') WHERE id=?",
+            (capture_id, json.dumps(bundle.get("features")),
+             # the capture tuned off-centre by LO_OFFSET_HZ and mixed it back out, so the
+             # audio sits at target_hz; episode.freq_hz is re-derived by the scout later.
+             int((bundle.get("capture") or {}).get("target_hz") or episode["freq_hz"]),
+             (vad or {}).get("verdict") if vad else "unchecked",
+             (vad or {}).get("speech_pct") if vad else None,
+             (vad or {}).get("max_prob") if vad else None,
+             episode_id),
         )
         conn.commit()
 
     intel = classify_signal(int(episode["freq_hz"]), {"features": bundle.get("features") or {}})
+    if vad:
+        intel = dict(intel)
+        intel["vad"] = vad
+        if vad.get("gate_pass"):
+            intel["likely"] = "Voice (demodulated audio)"
+            intel["confidence"] = "high"
     store.set_intel(episode_id, intel)
 
     pre_hits = bundle.get("decode") if isinstance(bundle.get("decode"), list) else None
     decoded = decode.decode_episode(episode, stored, pre_hits=pre_hits)
+
+    # Voice is a filter here too, but a guarded one: drop the audio only when the clip
+    # HAS audio, the gate says no voice, AND the decode ladder found nothing. APRS,
+    # LoRa and pager frames legitimately carry no voice, so a decoded frame always
+    # survives; the spectrogram png stays either way as the evidence for the episode.
+    if vad and not vad.get("gate_pass") and decoded.get("status") != "decoded":
+        _drop_audio(episode_id, stored, voice_gate.summary(vad))
+
     return {"intel": intel, "decoded": decoded, "artifacts": len(stored)}
+
+
+def _drop_audio(episode_id: int, stored: list[dict[str, Any]], why: str) -> None:
+    """Unregister and delete the audio artifacts of a capture that is not voice."""
+    audio = [a for a in stored if str(a.get("kind", "")).startswith("audio-")]
+    if not audio:
+        return
+    with store.connect() as conn:
+        conn.execute("DELETE FROM artifacts WHERE episode_id=? AND kind LIKE 'audio-%'",
+                     (episode_id,))
+        conn.execute(
+            "UPDATE episodes SET decode_status='rejected', decoded_summary=? WHERE id=?",
+            (f"no voice and nothing decoded ({why}) - audio discarded", episode_id),
+        )
+        conn.commit()
+    for art in audio:
+        try:
+            Path(art["path"]).unlink(missing_ok=True)
+        except OSError:
+            pass
+    stored[:] = [a for a in stored if not str(a.get("kind", "")).startswith("audio-")]
+    log(f"ep{episode_id} {why} - no voice, nothing decoded: audio discarded")
+
+
+def is_blank_capture(features: dict[str, Any]) -> bool:
+    """True when the dwell found nothing but the receiver's own noise.
+
+    ep36778 sat at 151.6 MHz with spectral flatness 0.93 across 5 MHz and no carrier
+    anywhere in the spectrum, yet it was stored and labelled "Radar / FMCW sweep
+    candidate". Flat *and* wide is noise: a real emitter leaves structure.
+    """
+    try:
+        flatness = float(features.get("spectral_flatness") or 0.0)
+        occupied = int(features.get("occupied_bandwidth_hz") or 0)
+    except (TypeError, ValueError):
+        return False
+    return flatness >= NOISE_FLATNESS and occupied >= NOISE_WIDE_HZ
 
 
 def capture_one(episode: dict[str, Any], *, dwell: float, max_dwell: float,
@@ -195,6 +278,19 @@ def capture_one(episode: dict[str, Any], *, dwell: float, max_dwell: float,
            if decoded["status"] == "decoded" else "")
         + f" in {elapsed:.1f}s"
     )
+    if NOISE_PURGE and is_blank_capture(bundle.get("features") or {}) and decoded["status"] != "decoded":
+        with store.connect() as conn:
+            conn.execute(
+                "UPDATE episodes SET class='noise', decode_status='rejected', decoded_summary=?"
+                " WHERE id=?",
+                ("blank capture: flat wideband noise, no carrier in the dwell", episode_id),
+            )
+            conn.commit()
+        shutil.rmtree(out_dir, ignore_errors=True)
+        log(f"ep{episode_id} {freq_mhz:.3f} MHz blank (flatness "
+            f"{(bundle.get('features') or {}).get('spectral_flatness')}) - purged, nothing recorded")
+        return {"episode_id": episode_id, "status": "blank", "decode": decoded["status"],
+                "seconds": round(elapsed, 1)}
     return {"episode_id": episode_id, "status": "captured", "dwell": dwell_actual,
             "decode": decoded["status"], "decode_type": decoded.get("decode_type"),
             "summary": decoded.get("summary"), "seconds": round(elapsed, 1)}

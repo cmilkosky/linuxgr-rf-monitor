@@ -125,3 +125,42 @@ dwells on a 1090 antenna hearing nothing. readsb takes `--device <index|serial>`
 so the lane is pinned `--device RTL0`; `rtl_sdr` only takes an index, so the
 hopper's env index must be re-checked after any USB add/remove/re-plug.
 
+## 2026-11-08: the antenna moved outdoors (AFTER, RSSI baseline starts here)
+
+Chain unchanged from the entry above — same FlightAware dual-band omni, same 32 ft
+cable, same Nooelec NESDR SMArt v5 (`RTL0`), same `readsb --gain 49.6` — but the
+antenna was moved from the indoor/marginal spot to its outdoor mounting. The two
+runs therefore differ in antenna position only, which is what makes this a real
+before/after.
+
+Measured with `tools/adsb_snapshot.py`, which reports the same range statistic as
+the entry above (great-circle from the station to every positioned aircraft) plus
+message rate and RSSI percentiles:
+
+| | 2026-11-02 indoors | 2026-11-08 outdoors |
+|---|---|---|
+| aircraft (positioned) | 30 (24) and 30 (26) | 43 (35), 47 (36), 49 (41) |
+| message rate | 166.6 and 161.7 msg/s | 246.4 and 290.2 msg/s |
+| max / p90 / median range | 96.4 / 75.7 / 40.9 km | 145.2 / 98.1 / 47.4 km |
+| | 126.7 / 61.4 / 36.7 km | 160.2 / 94.3 / 45.7 km |
+| RSSI min / median / max | not recorded | -35.6 / -32.4 / -3.8 |
+
+Three outdoor samples, 18:45-19:42 UTC on 2026-11-08. The outdoor position gained
+roughly **+55% aircraft, +75% message rate and +30-50% max range** on the same
+gain and the same radio, which is what you would expect from removing building
+loss in front of a chain that was already gain-starved. Median −32 dB RSSI says
+there is still dynamic range left, so the next lever is unchanged: an
+antenna-mounted 1090 LNA, then a dedicated collinear.
+
+**RSSI is only readable from this date forward.** The earlier baselines never
+recorded it, and the `history_*.json` files left over from the 2026-10-28
+dump1090-mutability runs are not comparable: that decoder's rssi is a different
+relative scale and it ran at default max gain. Compare RSSI only between runs of
+`readsb` at `--gain 49.6`.
+
+**Station position is not in this file or this repo deliberately** — it would
+publish a home address in a public repository. readsb reads it from
+`/home/cmilkosk/.config/rf-adsb-station.env` (mode 600, `RF_ADSB_LAT`/`RF_ADSB_LON`)
+via `EnvironmentFile=` in `deploy/rf-adsb-readsb.service`; a fresh host must
+recreate that file or the unit refuses to start rather than running positionless.
+

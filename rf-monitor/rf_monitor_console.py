@@ -8,6 +8,7 @@ import io
 import json
 import math
 import os
+import sqlite3
 import subprocess
 import statistics
 import threading
@@ -29,6 +30,9 @@ STATUS_PATH = Path(os.environ.get("RF_MONITOR_STATUS", "/home/cmilkosk/rf-monito
 RADIO_HEALTH_STATUS_PATH = Path(os.environ.get("RADIO_HEALTH_STATUS", "/home/cmilkosk/rf-monitor/radio-health.json"))
 RADIO_HEALTH_HISTORY_PATH = Path(os.environ.get("RADIO_HEALTH_HISTORY", "/home/cmilkosk/rf-monitor/radio-health-history.jsonl"))
 CAPTURE_DIR = Path(os.environ.get("RF_CAPTURE_DIR", "/home/cmilkosk/rf-monitor/captures"))
+SIGNALS_DIR = Path(os.environ.get("RF_SIGNALS_DIR", "/home/cmilkosk/rf-monitor/signals"))
+EPISODE_DIR = SIGNALS_DIR / "artifacts"
+SIGNALS_DB = Path(os.environ.get("RF_SIGNALS_DB", str(SIGNALS_DIR / "signals.db")))
 DEEP_SCAN_DIR = Path(os.environ.get("RF_DEEP_SCAN_DIR", "/home/cmilkosk/rf-monitor/deep-scans"))
 ASSET_DIR = Path(os.environ.get("RF_ASSET_DIR", "/home/cmilkosk/rf-monitor/assets"))
 DEVICE_LOCK_PATH = Path(os.environ.get("RF_HACKRF_LOCK", "/tmp/hackrf-monitor-device.lock"))
@@ -870,6 +874,90 @@ def capture_record(meta_path: Path) -> dict[str, Any]:
     return data
 
 
+def episode_db_row(episode_id: str) -> dict[str, Any]:
+    """Classification for an auto-lane episode lives in signals.db, not the artifact."""
+    if not episode_id.isdigit():
+        return {}
+    try:
+        conn = sqlite3.connect(f"file:{SIGNALS_DB}?mode=ro", uri=True, timeout=2)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT id, freq_hz, likely, confidence, score, decode_type, decode_status,"
+            " decoded_summary, first_seen, last_seen, class, intel_json FROM episodes WHERE id=?",
+            (int(episode_id),),
+        ).fetchone()
+        conn.close()
+    except sqlite3.Error:
+        return {}
+    if row is None:
+        return {}
+    data = dict(row)
+    try:
+        data["signal_intel"] = json.loads(data.pop("intel_json") or "{}")
+    except (TypeError, ValueError):
+        data["signal_intel"] = {}
+    return data
+
+
+def episode_dir_path(episode_id: str) -> Path:
+    if not episode_id.isdigit():
+        raise HTTPException(400, "Invalid episode id")
+    return EPISODE_DIR / episode_id
+
+
+def episode_record(dir_path: Path) -> dict[str, Any] | None:
+    """Shape an auto-lane artifact like a manual capture so one console renders both.
+
+    The capture lane writes signals/artifacts/<episode>/{capture.json,spectrum.png,
+    audio-*.mp3} and never touched the console, so 114 recordings were invisible.
+    """
+    try:
+        bundle = json.loads((dir_path / "capture.json").read_text())
+    except (OSError, ValueError):
+        return None
+    capture = bundle.get("capture") or {}
+    features = bundle.get("features") or {}
+    audio = bundle.get("audio") or {}
+    episode_id = dir_path.name
+    db = episode_db_row(episode_id)
+    target_hz = int(capture.get("target_hz") or capture.get("frequency_hz") or db.get("freq_hz") or 0)
+    if target_hz <= 0:
+        return None
+    started_at = capture.get("started_at") or db.get("first_seen") or ""
+    spectrum_url = f"/api/episodes/{episode_id}/spectrum"
+    audio_urls = {
+        mode: f"/api/episodes/{episode_id}/audio/{mode}"
+        for mode, info in audio.items()
+        if isinstance(info, dict) and (info.get("mp3") or info.get("wav"))
+    }
+    return {
+        "id": f"ep{episode_id}",
+        "episode_id": episode_id,
+        "source": "auto",
+        "status": "complete",
+        "started_at": started_at,
+        "completed_at": db.get("last_seen") or started_at,
+        "frequency_hz": target_hz,
+        "frequency_mhz": round(target_hz / 1_000_000, 6),
+        "sample_rate_hz": int(capture.get("sample_rate_hz") or 5_000_000),
+        "duration_seconds": bundle.get("duration_seconds") or capture.get("dwell_seconds") or 0,
+        "analysis": {"features": features, "peak_frequency_mhz": features.get("peak_frequency_mhz")},
+        "signal_intel": db.get("signal_intel") or {},
+        "decode": {
+            "type": db.get("decode_type"),
+            "status": db.get("decode_status"),
+            "summary": db.get("decoded_summary"),
+        },
+        "audio_urls": audio_urls,
+        "audio_type": "audio/mpeg",
+        "meta_url": f"/api/episodes/{episode_id}/meta",
+        "spectrogram_url": spectrum_url,
+        "animation_url": spectrum_url,
+        "animation_still_url": spectrum_url,
+        "animation_viewer_url": spectrum_url,
+    }
+
+
 def read_iq_file(iq_path: Path) -> Any:
     import numpy as np
 
@@ -1496,11 +1584,60 @@ def identify_signal(payload: dict[str, Any] = Body(...)) -> JSONResponse:
     return JSONResponse(report)
 
 
+def recent_episode_dirs(limit: int) -> list[Path]:
+    if limit <= 0 or not EPISODE_DIR.exists():
+        return []
+    dirs = [p for p in EPISODE_DIR.iterdir() if p.is_dir() and p.name.isdigit()]
+    dirs.sort(key=lambda p: int(p.name), reverse=True)
+    return dirs[:limit]
+
+
 @app.get("/api/captures")
 def captures(limit: int = Query(12, ge=1, le=100)) -> JSONResponse:
+    """Manual console captures plus the capture lane's artifact recordings.
+
+    The lane writes signals/artifacts/<episode>/ and used to be invisible here:
+    this list only ever showed manual grabs, whose newest was 2026-06-19.
+    """
     CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
     records = [capture_record(path) for path in sorted(CAPTURE_DIR.glob("*.json"), reverse=True)[:limit]]
-    return JSONResponse({"items": records, "capture_running": CAPTURE_LOCK.locked()})
+    records += [r for r in (episode_record(p) for p in recent_episode_dirs(limit)) if r]
+    records.sort(key=lambda item: str(item.get("started_at") or ""), reverse=True)
+    return JSONResponse({"items": records[:limit], "capture_running": CAPTURE_LOCK.locked()})
+
+
+@app.get("/api/episodes")
+def episodes(limit: int = Query(24, ge=1, le=200)) -> JSONResponse:
+    records = [r for r in (episode_record(p) for p in recent_episode_dirs(limit)) if r]
+    return JSONResponse({"items": records})
+
+
+@app.get("/api/episodes/{episode_id}/meta")
+def episode_meta(episode_id: str) -> JSONResponse:
+    path = episode_dir_path(episode_id) / "capture.json"
+    if not path.exists():
+        raise HTTPException(404, "Episode metadata not found")
+    return JSONResponse(json.loads(path.read_text()))
+
+
+@app.get("/api/episodes/{episode_id}/spectrum")
+def episode_spectrum(episode_id: str) -> FileResponse:
+    path = episode_dir_path(episode_id) / "spectrum.png"
+    if not path.exists():
+        raise HTTPException(404, "Episode spectrum not found")
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.get("/api/episodes/{episode_id}/audio/{mode}")
+def episode_audio(episode_id: str, mode: str) -> FileResponse:
+    if mode not in ("am", "nfm", "wfm"):
+        raise HTTPException(400, "mode must be am, nfm or wfm")
+    base = episode_dir_path(episode_id)
+    for suffix, media in ((".mp3", "audio/mpeg"), (".wav", "audio/wav")):
+        path = base / f"audio-{mode}{suffix}"
+        if path.exists():
+            return FileResponse(path, media_type=media, headers={"Cache-Control": "public, max-age=86400"})
+    raise HTTPException(404, "Episode audio not found")
 
 
 @app.post("/api/capture")
@@ -2655,9 +2792,9 @@ function captureItemHtml(capture) {
     <div class="mediaShell"><img id="capture-img-${capture.id}" class="captureImg" onclick="toggleGifPreview('capture-img-${capture.id}')" ondblclick="window.open('${capture.animation_viewer_url}', '_blank')" data-playing="true" data-animation-url="${capture.animation_url}" data-still-url="${capture.animation_still_url}" data-current-url="${capture.animation_url}" src="${capture.animation_url}?t=${encodeURIComponent(capture.completed_at || capture.started_at)}" alt="Animated spectrum for ${capture.frequency_mhz.toFixed(3)} MHz capture"><span id="capture-img-${capture.id}-pill" class="pausePill">Playing</span></div>
     <div id="capture-caption-${capture.id}" class="captureCaption">Animated spectrum: each frame is about 1 second. X axis is frequency, Y axis is relative strength. Download IQ is the raw radio sample file for later demodulation/classification.</div>
     <div class="audioPreview">
-      <div class="audioRow"><span>AM</span><audio controls preload="metadata"><source src="${audioSrc('am')}" type="audio/wav"></audio><a class="audioLink" href="${audioSrc('am')}" target="_blank">Open</a></div>
-      <div class="audioRow"><span>NFM</span><audio controls preload="metadata"><source src="${audioSrc('nfm')}" type="audio/wav"></audio><a class="audioLink" href="${audioSrc('nfm')}" target="_blank">Open</a></div>
-      <div class="audioRow"><span>WFM</span><audio controls preload="metadata"><source src="${audioSrc('wfm')}" type="audio/wav"></audio><a class="audioLink" href="${audioSrc('wfm')}" target="_blank">Open</a></div>
+      <div class="audioRow"><span>AM</span><audio controls preload="metadata"><source src="${audioSrc('am')}" type="${capture.audio_type || 'audio/wav'}"></audio><a class="audioLink" href="${audioSrc('am')}" target="_blank">Open</a></div>
+      <div class="audioRow"><span>NFM</span><audio controls preload="metadata"><source src="${audioSrc('nfm')}" type="${capture.audio_type || 'audio/wav'}"></audio><a class="audioLink" href="${audioSrc('nfm')}" target="_blank">Open</a></div>
+      <div class="audioRow"><span>WFM</span><audio controls preload="metadata"><source src="${audioSrc('wfm')}" type="${capture.audio_type || 'audio/wav'}"></audio><a class="audioLink" href="${audioSrc('wfm')}" target="_blank">Open</a></div>
     </div>
     <div class="captureCaption">Try AM, NFM, and WFM. If all three are static/noise, the signal is probably digital, too wide/narrow for this preset, offset from center, or not audio-bearing.</div>` : '';
   const peak = analysis.peak_frequency_mhz ? `<br>Peak ${analysis.peak_frequency_mhz.toFixed(6)} MHz` : '';
@@ -2671,8 +2808,8 @@ function captureItemHtml(capture) {
       <button class="smallBtn" onclick="window.open('${capture.animation_viewer_url}', '_blank')">View Animation</button>
       <button class="smallBtn" onclick="window.open('${capture.spectrogram_url}', '_blank')">View Spectrogram</button>
       <button class="smallBtn" onclick="window.open('${capture.meta_url}', '_blank')">Details</button>
-      <button class="smallBtn" onclick="window.open('${capture.sigmf_url}', '_blank')">SigMF</button>
-      <button class="smallBtn" onclick="window.open('${capture.iq_url}', '_blank')">Download IQ</button>
+      ${capture.sigmf_url ? `<button class="smallBtn" onclick="window.open('${capture.sigmf_url}', '_blank')">SigMF</button>` : ''}
+      ${capture.iq_url ? `<button class="smallBtn" onclick="window.open('${capture.iq_url}', '_blank')">Download IQ</button>` : ''}
     </div>
     ${featureSummary}
     ${intelSummary}

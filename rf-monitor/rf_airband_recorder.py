@@ -35,6 +35,7 @@ import numpy as np
 
 import rf_decode
 import rf_v2_capture as cap
+import rf_voice_gate as voice_gate
 import signals_store as store
 
 START_HZ = int(float(os.environ.get("RF_AIRBAND_START_HZ", 108_000_000)))
@@ -210,15 +211,40 @@ def _record(iq, rate, center_hz, freq_hz, audio, mod, speech, level_db) -> bool:
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     wav = out_dir / f"audio-am-{int(freq_hz // 1000)}kHz-{stamp}.wav"
     info = cap.write_wav(audio, wav)
+    # Silero VAD decides whether this is voice, and here it is a filter: this lane
+    # exists to record voice, so a clip it rejects is not kept at all. Gate before
+    # the mp3/artifact write so a reject costs nothing. Fail open - if the gate is
+    # down (vad is None) keep the clip rather than silently losing transmissions.
+    vad = voice_gate.gate_file(wav)
+    if vad and not vad["gate_pass"]:
+        wav.unlink(missing_ok=True)
+        store.set_intel(episode_id, {"likely": "AM carrier (no voice)", "confidence": "medium",
+                                     "vad": vad})
+        store.set_voice(episode_id, vad)
+        store.record_attempt(episode_id, "airband-recorder", "rejected",
+                             f"{audio.size / 48000:.1f}s audio, {voice_gate.summary(vad)}")
+        log(f"REJECTED ep{episode_id} {freq_hz / 1e6:.3f} MHz mod={mod:.2f} "
+            f"{voice_gate.summary(vad)} - no voice, nothing kept")
+        return False
+
     cap._to_mp3(wav, wav.with_suffix(".mp3"))
     store.add_artifact(episode_id, "audio-am", wav, size=info["bytes"])
+    if vad:
+        store.set_intel(episode_id, {"likely": "Aviation AM voice", "confidence": "high",
+                                     "vad": vad})
+    store.set_voice(episode_id, vad)
+    with store.connect() as conn:
+        conn.execute("UPDATE episodes SET demod_freq_hz=? WHERE id=?",
+                     (int(freq_hz), int(episode_id)))
+        conn.commit()
     store.mark_decoded(episode_id, "aircraft",
                        f"AM audio {audio.size / 48000:.1f}s @ {freq_hz / 1e6:.3f} MHz "
-                       f"(+{level_db:.0f} dB, mod {mod:.2f}) - listen to confirm voice")
+                       f"(+{level_db:.0f} dB, mod {mod:.2f}; {voice_gate.summary(vad)})")
     store.record_attempt(episode_id, "airband-recorder", "ok",
                          f"{audio.size / 48000:.1f}s audio mod={mod:.2f} speech={speech:.2f}")
     log(f"RECORDED ep{episode_id} {freq_hz / 1e6:.3f} MHz {audio.size / 48000:.1f}s "
-        f"mod={mod:.2f} speech={speech:.2f} -> {wav.with_suffix('.mp3').name}")
+        f"mod={mod:.2f} speech={speech:.2f} {voice_gate.summary(vad)} "
+        f"-> {wav.with_suffix('.mp3').name}")
     return True
 
 
@@ -257,8 +283,11 @@ def cycle(centers: list[int] | None = None) -> int:
                     continue          # 3-9 dB above the floor is receiver noise, not a station
                 if m["dyn_db"] < DYN_MIN_DB or m["quiet"] < QUIET_MIN:
                     continue
-                if _record(iq, CHUNK_RATE, center, freq, audio, m["mod"], m["speech"], level_db):
-                    _last[freq] = time.time()
+                # Cooldown either way: a carrier that reads as no-voice now may carry
+                # a transmission later, but re-gating it every pass is pointless noise.
+                kept = _record(iq, CHUNK_RATE, center, freq, audio, m["mod"], m["speech"], level_db)
+                _last[freq] = time.time()
+                if kept:
                     recorded += 1
                     if recorded >= MAX_PER_CYCLE:
                         return recorded

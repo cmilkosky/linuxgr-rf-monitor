@@ -1,5 +1,11 @@
 # Hopper lane: one parked radio, every watchlist frequency
 
+> **Superseded 2026-11-09 by [`rf-scanner`](WATCHLIST-SCANNER.md)** (design A: one
+> wide capture, every watchlist channel in the same FFT pass, AM/NFM voice +
+> data decode). `rf-hopper` is disabled; this page stays for the history and for
+> the parked-radio registry. The one thing still worth reading here: a parked
+> entry with no free radio is recorded with `radio` NULL on purpose.
+
 The watchlist records intent. The hopper is what serves it.
 
 RTL2 hears ~2.4 MHz at a time, and the watchlist spans 144.390 MHz to 930.0 MHz —

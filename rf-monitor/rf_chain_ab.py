@@ -28,6 +28,7 @@ sys.path.insert(0, "/home/cmilkosk/rf-monitor")
 import rf_v2_capture as cap  # noqa: E402
 
 REFS = [
+    (98_000_000, "FM band 98.0"),
     (121_500_000, "airband 121.5"),
     (156_800_000, "VHF marine 156.8"),
     (433_920_000, "UHF 433.92"),

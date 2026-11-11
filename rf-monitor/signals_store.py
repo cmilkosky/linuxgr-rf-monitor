@@ -59,6 +59,11 @@ CREATE TABLE IF NOT EXISTS episodes (
     decode_status   TEXT NOT NULL DEFAULT 'none',
     decoded_summary TEXT,
     capture_id      TEXT,
+    demod_freq_hz   INTEGER,
+    voice_verdict   TEXT,
+    voice_speech_pct REAL,
+    voice_max_prob  REAL,
+    voice_checked_at TEXT,
     features_json   TEXT,
     intel_json      TEXT,
     source          TEXT,
@@ -167,7 +172,14 @@ def init_db() -> None:
         conn.executescript(SCHEMA)
         # additive migrations for DBs created by an earlier v2 build
         columns = {row[1] for row in conn.execute("PRAGMA table_info(episodes)")}
-        for name, ddl in (("delta_db", "ALTER TABLE episodes ADD COLUMN delta_db REAL"),):
+        for name, ddl in (
+            ("delta_db", "ALTER TABLE episodes ADD COLUMN delta_db REAL"),
+            ("demod_freq_hz", "ALTER TABLE episodes ADD COLUMN demod_freq_hz INTEGER"),
+            ("voice_verdict", "ALTER TABLE episodes ADD COLUMN voice_verdict TEXT"),
+            ("voice_speech_pct", "ALTER TABLE episodes ADD COLUMN voice_speech_pct REAL"),
+            ("voice_max_prob", "ALTER TABLE episodes ADD COLUMN voice_max_prob REAL"),
+            ("voice_checked_at", "ALTER TABLE episodes ADD COLUMN voice_checked_at TEXT"),
+        ):
             if name not in columns:
                 conn.execute(ddl)
         conn.commit()
@@ -373,6 +385,29 @@ def record_attempt(episode_id: int, decoder: str, status: str, detail: str | Non
             " VALUES (?,?,?,?,?,?)",
             (int(episode_id), str(decoder), str(status), (detail or "")[:500],
              started_at or utcnow(), utcnow()),
+        )
+        conn.commit()
+
+
+def set_voice(episode_id: int, verdict: dict[str, Any] | None) -> None:
+    """Record a voice-gate verdict in its own columns.
+
+    The scout re-derives `likely`/`intel_json` on every sweep, so the voice answer cannot
+    live there without decaying. These columns are written only by the stages that actually
+    listened; `unchecked` means no gate ran (gate down or lane not yet wired).
+    """
+    verdict = verdict or {}
+    with connect() as conn:
+        conn.execute(
+            "UPDATE episodes SET voice_verdict=?, voice_speech_pct=?, voice_max_prob=?,"
+            " voice_checked_at=? WHERE id=?",
+            (
+                verdict.get("verdict") or "unchecked",
+                verdict.get("speech_pct"),
+                verdict.get("max_prob"),
+                utcnow(),
+                int(episode_id),
+            ),
         )
         conn.commit()
 

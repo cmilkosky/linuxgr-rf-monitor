@@ -23,9 +23,18 @@ Group=cmilkosk
 # 1090/978 antenna (hub port 7-1.1.3), NOT an index. libusb indices re-order
 # whenever a dongle is added or re-plugged (2026-11-02: 0=RTL3, 1=RTL0, 2=RTL2),
 # and an index pin silently followed the shuffle. readsb accepts index or serial.
+# Station position, for tar1090 range rings and for computing max/p90/median range
+# the same way docs/ADSB-BASELINE.md does. The latitude/longitude are NOT in this
+# file: this repo is public and that would publish a home address. They live only on
+# the host in /home/cmilkosk/.config/rf-adsb-station.env (mode 600) and reach readsb
+# through this EnvironmentFile. Reinstalling the unit onto a fresh host requires
+# recreating that file (RF_ADSB_LAT=<lat>, RF_ADSB_LON=<lon>), otherwise the unit
+# fails to start on the missing file rather than running without a position.
+EnvironmentFile=/home/cmilkosk/.config/rf-adsb-station.env
 ExecStart=/usr/local/bin/readsb \
     --device-type rtlsdr --device RTL0 \
     --gain 49.6 \
+    --lat ${RF_ADSB_LAT} --lon ${RF_ADSB_LON} \
     --write-json /home/cmilkosk/rf-monitor/signals/adsb --write-json-every 1 \
     --db-file /usr/local/share/tar1090/aircraft.csv.gz \
     --quiet
